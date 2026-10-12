@@ -88,17 +88,20 @@ export async function saosGetJudgment(id: string | number): Promise<unknown> {
 // Local mirror
 // ---------------------------------------------------------------------------
 
-let store: Store | null | undefined;
+let store: Store | null = null;
+let lastOpenError = 0;
 
+// Not cached while missing: the sync child creates the file after the server
+// started, and the server must pick it up without a restart.
 export function localStore(): Store | null {
-  if (store === undefined) {
-    const path = defaultDbPath();
-    try {
-      store = process.env.SAOS_LOCAL !== "0" && existsSync(path) ? new Store(path) : null;
-    } catch (err) {
-      process.stderr.write(`mcp-saos: local dump unavailable (${String(err)}), using SAOS API\n`);
-      store = null;
-    }
+  if (store || process.env.SAOS_LOCAL === "0") return store;
+  const path = defaultDbPath();
+  if (!existsSync(path) || Date.now() - lastOpenError < 60_000) return null;
+  try {
+    store = new Store(path);
+  } catch (err) {
+    lastOpenError = Date.now();
+    process.stderr.write(`mcp-saos: local dump unavailable (${String(err)}), using SAOS API\n`);
   }
   return store;
 }
