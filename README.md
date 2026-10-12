@@ -135,6 +135,31 @@ stdout <--  formatted text responses  <--
 No external dependencies for HTTP/JSON - requests go through the built-in `node:https`.
 The only production dependency: `@modelcontextprotocol/sdk`.
 
+## Local SAOS mirror (fork elconcept, 1.3.0+)
+
+The server answers from a local copy of the official SAOS bulk dump (`/api/dump/judgments`) instead of calling the
+search API on every request:
+
+- `npm run sync` (or the built-in scheduler in HTTP mode) downloads the whole database once (date windows, resumable,
+  each window checked against the SAOS search count), then incrementally every day (`sinceModificationDate`).
+- Storage: SQLite with FTS5 at `SAOS_DB` (default `/data/saos.sqlite`, ~30 GB). Requires Node >= 22.13 (`node:sqlite`);
+  on older Node, or without the database file, the server uses the SAOS API exactly as before.
+- When the local answer is empty the SAOS API is queried as a cross-check. An upstream hit missing locally is
+  returned with `structuredContent.source = "saos_api_fallback"`, annotated in the text and recorded in the
+  `discrepancies` table (visible at `GET /status`).
+- Full-text: unquoted words are prefix-matched after removing the Polish inflection ending, `"quoted phrases"` match
+  exactly, `-word` excludes, `OR` alternates. Order: judgment date DESC, as in SAOS.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCP_TRANSPORT` | stdio | `http` = Streamable HTTP on `PORT` (8000), path `MCP_HTTP_PATH` (`/mcp`) |
+| `SAOS_DB` | `/data/saos.sqlite` | local mirror |
+| `SAOS_SYNC` | on in HTTP mode | `0` disables the scheduler, `1` enables it in stdio mode |
+| `SAOS_SYNC_AT` | `03:30` | daily incremental sync (container time) |
+| `SAOS_SYNC_CONCURRENCY` | 3 | parallel date windows during the full download |
+| `SAOS_LOCAL` | on | `0` = always use the SAOS API |
+| `SAOS_TOR` / `SAOS_TOR_PROXY` | 1 / set by `start.sh` | retries go through Tor with a fresh circuit |
+
 ## Limitations and known pitfalls
 
 - `pageSize` has a hard lower limit of 10 (SAOS returns HTTP 400 for less) -

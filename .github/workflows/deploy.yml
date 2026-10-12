@@ -1,0 +1,20 @@
+# Przebudowa na NAS po pushu: zgloszenie do deploy-hook (https://deploy.xlap.pl, Cloudflare Access).
+# Nie czeka na build - hook odpowiada 202 od razu, wynik: GET /status (albo status commita "deploy/ds1821").
+name: deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency: deploy
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Zgloszenie przebudowy
+        run: |
+          curl -fsS --retry 3 --retry-all-errors -m 30 -X POST "https://deploy.xlap.pl/deploy/${GITHUB_REPOSITORY}" \
+            -H "CF-Access-Client-Id: ${{ secrets.DEPLOY_CF_CLIENT_ID }}" \
+            -H "CF-Access-Client-Secret: ${{ secrets.DEPLOY_CF_CLIENT_SECRET }}" \
+            -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN }}" \
+            -H "Content-Type: application/json" -d "{\"sha\":\"${GITHUB_SHA}\"}"

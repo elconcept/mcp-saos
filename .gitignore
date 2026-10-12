@@ -9,3 +9,6 @@ dist/
 .claude/*.local.*
 .claude/settings.local.json
 .claude/security/
+
+# Lokalna kopia dumpu SAOS (SQLite, dziesiatki GB)
+data/

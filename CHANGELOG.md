@@ -3,6 +3,24 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-12
+
+Lokalna kopia dumpu SAOS jako silnik wyszukiwania (fork elconcept). **Backward-compatible** - narzedzia, schematy i opisy bez zmian (descriptor lock OK).
+
+### Added
+
+- `src/sync.ts` - pobieranie calej bazy z oficjalnego `/api/dump/judgments` (okna dat, pageSize 100, wznawianie po przerwaniu, kontrola liczby kazdego okna wzgledem API wyszukiwania) i codzienna aktualizacja przyrostowa (`sinceModificationDate`, zakladka 2 dni). Nazwy sadow i wydzialow z `/api/dump/commonCourts` i `/api/dump/scChambers`.
+- `src/store.ts` - SQLite (`node:sqlite`, FTS5): surowy JSON dumpu (deflate) zwracany bez zmian + indeks pelnotekstowy (tresc, sygnatury, sklad, podstawy prawne, przywolane akty, slowa kluczowe). rowid = data*1e7 + id, wiec sortowanie po dacie DESC i zakresy dat sa tanie.
+- `src/engine.ts` - najpierw lokalnie; gdy lokalnie pusto, zapytanie do API SAOS. Wynik z API, ktorego nie ma lokalnie = rozbieznosc: zwracany (`structuredContent.source = "saos_api_fallback"`, adnotacja w tekscie), zapisany w tabeli `discrepancies` i na stderr. Do czasu ukonczenia pierwszego pobrania wszystko idzie do API jak dotad.
+- `structuredContent.source`: `local_dump` / `saos_api` / `saos_api_fallback` (pole dodatkowe, `citations` bez zmian).
+- Transport Streamable HTTP (`MCP_TRANSPORT=http`, `/mcp`, bezstanowy) + `/healthz` + `/status` (stan kopii, ostatnie rozbieznosci). W trybie HTTP harmonogram synchronizacji (`SAOS_SYNC_AT`, domyslnie 03:30).
+- Tor jako zapasowa droga: ponowienia zapytan ida przez SOCKS (`SAOS_TOR_PROXY`) z nowym obwodem.
+- Dockerfile/compose/workflow wdrozenia na NAS (stack Portainera `mcp-saos`, https://mcp-saos.xlap.pl/mcp).
+
+### Changed
+
+- Wyszukiwanie lokalne: slowa bez cudzyslowu sa skracane o koncowke fleksyjna i szukane prefiksowo (`umowa` -> `umow*`), frazy w cudzyslowie dokladnie, `-slowo` wyklucza, `OR` laczy. Wyniki moga sie roznic od Solr SAOS (inny stemming); kolejnosc jak w SAOS (data DESC).
+
 ## [1.2.0] - 2026-07-13
 
 Citator "czy wyrok zyje". **Backward-compatible** - istniejace 3 narzedzia bez zmian.

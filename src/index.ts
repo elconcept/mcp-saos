@@ -13,6 +13,11 @@
  *   search_by_case  - shortcut: search by case number (sygnatura akt)
  *   saos_cite_check - citator "is the judgment alive": later citing judgments
  *                     + phrase scan for line-breaking language (see cite-check.ts)
+ *
+ * Engine (src/engine.ts): queries are answered from a local mirror of the SAOS
+ * dump (src/sync.ts keeps it current daily); the SAOS API is the fallback and a
+ * cross-check - an upstream hit missing locally is logged as a discrepancy.
+ * Transport: stdio (default) or Streamable HTTP (MCP_TRANSPORT=http, see main()).
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -21,9 +26,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import https from "node:https";
-import http from "node:http";
-import { URL } from "node:url";
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
 import {
   parseCaseNumber,
   buildCaseNumberRegex,
@@ -33,139 +38,14 @@ import {
   CITE_CHECK_DISCLAIMER,
   type ScanHit,
 } from "./cite-check.js";
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const SAOS_BASE = "https://www.saos.org.pl/api";
-const USER_AGENT = "MateMatic-MCP-SAOS/1.0 (+https://matematic.co)";
-
-// Minimum pageSize enforced by the SAOS API. Smaller values return HTTP 400.
-const PAGE_SIZE_MIN = 10;
-const PAGE_SIZE_DEFAULT = 10;
-
-// ---------------------------------------------------------------------------
-// HTTP helper - fetch JSON from a URL (no external deps)
-// ---------------------------------------------------------------------------
-
-function fetchJson(urlStr: string): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(urlStr);
-    const transport = parsedUrl.protocol === "https:" ? https : http;
-
-    const options = {
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
-      path: parsedUrl.pathname + parsedUrl.search,
-      headers: {
-        "User-Agent": USER_AGENT,
-        Accept: "application/json",
-      },
-      timeout: 40000,
-    };
-
-    const req = transport.get(options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on("data", (chunk: Buffer) => chunks.push(chunk));
-      res.on("end", () => {
-        const body = Buffer.concat(chunks).toString("utf-8");
-        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-          reject(
-            new Error(
-              `HTTP ${res.statusCode}: ${body.slice(0, 300)}`
-            )
-          );
-          return;
-        }
-        try {
-          resolve(JSON.parse(body));
-        } catch {
-          reject(new Error(`Invalid JSON response from SAOS: ${body.slice(0, 200)}`));
-        }
-      });
-    });
-
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("Request to SAOS API timed out after 40s"));
-    });
-
-    req.on("error", (err: Error) => reject(err));
-  });
-}
-
-// ---------------------------------------------------------------------------
-// HTML stripping helper
-// ---------------------------------------------------------------------------
-
-function stripHtml(html: string): string {
-  // Remove HTML tags and decode basic entities
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-// ---------------------------------------------------------------------------
-// SAOS API functions
-// ---------------------------------------------------------------------------
-
-interface SearchParams {
-  all?: string;
-  caseNumber?: string;
-  courtType?: string;
-  judgeName?: string;
-  referencedRegulation?: string;
-  legalBase?: string;
-  judgmentDateFrom?: string;
-  judgmentDateTo?: string;
-  pageSize?: number;
-  pageNumber?: number;
-}
-
-async function saosSearch(params: SearchParams): Promise<unknown> {
-  // Enforce minimum pageSize
-  const size = Math.max(
-    PAGE_SIZE_MIN,
-    typeof params.pageSize === "number" ? params.pageSize : PAGE_SIZE_DEFAULT
-  );
-
-  const query: Record<string, string> = {
-    pageSize: String(size),
-    pageNumber: String(params.pageNumber ?? 0),
-    sortingField: "JUDGMENT_DATE",
-    sortingDirection: "DESC",
-  };
-
-  if (params.all) query.all = params.all;
-  if (params.caseNumber) query.caseNumber = params.caseNumber;
-  if (params.courtType) query.courtType = params.courtType;
-  if (params.judgeName) query.judgeName = params.judgeName;
-  if (params.referencedRegulation)
-    query.referencedRegulation = params.referencedRegulation;
-  if (params.legalBase) query.legalBase = params.legalBase;
-  if (params.judgmentDateFrom) query.judgmentDateFrom = params.judgmentDateFrom;
-  // Default the upper date bound to today. SAOS data contains OCR-mangled
-  // dates (e.g. year 3013) which, under DESC date sorting, would otherwise
-  // occupy the top result slots and push genuine recent judgments off-page.
-  query.judgmentDateTo =
-    params.judgmentDateTo ?? new Date().toISOString().slice(0, 10);
-
-  const qs = new URLSearchParams(query).toString();
-  return fetchJson(`${SAOS_BASE}/search/judgments?${qs}`);
-}
-
-async function saosGetJudgment(id: string | number): Promise<unknown> {
-  const data = (await fetchJson(`${SAOS_BASE}/judgments/${id}`)) as Record<string, unknown>;
-  return data["data"] ?? data;
-}
+import { stripHtml } from "./text.js";
+import {
+  searchJudgments,
+  getJudgment,
+  localStore,
+  PAGE_SIZE_DEFAULT,
+  type Source,
+} from "./engine.js";
 
 // ---------------------------------------------------------------------------
 // Response formatters
@@ -398,6 +278,27 @@ function buildJudgmentCitation(raw: unknown): SaosCitation | null {
 }
 
 // ---------------------------------------------------------------------------
+// Data source reporting (local dump vs SAOS API)
+// ---------------------------------------------------------------------------
+
+function combineSources(sources: Set<Source>): Source {
+  if (sources.has("saos_api_fallback")) return "saos_api_fallback";
+  if (sources.has("saos_api")) return "saos_api";
+  return "local_dump";
+}
+
+function sourceNote(source: Source): string {
+  return source === "saos_api_fallback"
+    ? "Uwaga: wynik pobrany z API SAOS - brak go w lokalnej kopii bazy (rozbieznosc zarejestrowana do weryfikacji)."
+    : "";
+}
+
+function withSourceNote(text: string, source: Source): string {
+  const note = sourceNote(source);
+  return note ? `${text}\n\n${note}` : text;
+}
+
+// ---------------------------------------------------------------------------
 // Citator - orchestration for saos_cite_check (pure logic in cite-check.ts)
 // ---------------------------------------------------------------------------
 
@@ -469,11 +370,10 @@ async function runCiteCheck(a: Record<string, unknown>) {
 
   // 1. Locate the target judgment (for its date). Prefer SUPREME on ambiguity -
   //    identical signatures repeat across common courts.
-  const targetRaw = (await saosSearch({
-    caseNumber: caseNo,
-    courtType,
-    pageSize: 20,
-  })) as SearchResponse;
+  const sources = new Set<Source>();
+  const targetRes = await searchJudgments({ caseNumber: caseNo, courtType, pageSize: 20 }, "saos_cite_check");
+  sources.add(targetRes.source);
+  const targetRaw = targetRes.data as SearchResponse;
   const targetPool = (targetRaw.items ?? []).filter((it) => matchesCaseNumber(it, caseRe));
   const courtRank = (it: JudgmentItem): number => {
     if (it.courtType === "SUPREME") return 0;
@@ -488,10 +388,9 @@ async function runCiteCheck(a: Record<string, unknown>) {
   const targetDate = target && isValidDate(target.judgmentDate) ? target.judgmentDate : null;
 
   // 2. Later judgments citing the signature - quoted full-text phrase search.
-  const citingRaw = (await saosSearch({
-    all: `"${caseNo}"`,
-    pageSize: 100,
-  })) as SearchResponse;
+  const citingRes = await searchJudgments({ all: `"${caseNo}"`, pageSize: 100 }, "saos_cite_check");
+  sources.add(citingRes.source);
+  const citingRaw = citingRes.data as SearchResponse;
   const totalCitingRaw = citingRaw.info?.totalResults ?? 0;
 
   const citing = (citingRaw.items ?? [])
@@ -549,7 +448,9 @@ async function runCiteCheck(a: Record<string, unknown>) {
       const details = await Promise.all(
         batch.map(async (it) => {
           try {
-            return (await saosGetJudgment(it.id as number)) as JudgmentData;
+            const res = await getJudgment(it.id as number, "saos_cite_check");
+            sources.add(res.source);
+            return res.data as JudgmentData;
           } catch {
             return null; // single fetch failure must not sink the whole check
           }
@@ -621,6 +522,8 @@ async function runCiteCheck(a: Record<string, unknown>) {
 
   lines.push("");
   lines.push(CITE_CHECK_DISCLAIMER);
+  const srcNote = sourceNote(combineSources(sources));
+  if (srcNote) lines.push("", srcNote);
 
   return {
     content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -640,6 +543,7 @@ async function runCiteCheck(a: Record<string, unknown>) {
       scanned_deep: scannedDeep,
       hits,
       disclaimer: CITE_CHECK_DISCLAIMER,
+      source: combineSources(sources),
       citations: buildSearchCitations({ items: citing.slice(0, CITE_DISPLAY_LIMIT) }),
     },
   };
@@ -653,7 +557,7 @@ async function runCiteCheck(a: Record<string, unknown>) {
 // Pattern z dograh-hq/dograh v1.31.0 (BSD-2), zaadaptowany na MateMatic.
 // ---------------------------------------------------------------------------
 
-const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy SAOS (saos.org.pl) - sady powszechne, Sad Najwyzszy, Trybunal Konstytucyjny, KIO. Bez cache'owania, bez modyfikacji tresci - dane primary z API publicznego (Fundacja ePanstwo, bez klucza).
+const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy SAOS (saos.org.pl) - sady powszechne, Sad Najwyzszy, Trybunal Konstytucyjny, KIO. Odpowiedzi z lokalnej kopii oficjalnego dumpu SAOS (aktualizowanej codziennie), z API SAOS jako zapasem i weryfikacja; bez modyfikacji tresci - dane primary (Fundacja ePanstwo).
 
 ## Kolejnosc wywolan
 
@@ -670,7 +574,7 @@ const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy
 - **Pokrycie nierowne** - sady powszechne dobrze, SN/TK/KIO obecne. **Sady administracyjne (WSA/NSA) NIE sa w SAOS** - dla nich uzyj mcp-nsa (orzeczenia.nsa.gov.pl).
 - **Daty znieksztalcone przez OCR** - mozesz zobaczyc "rok 3013" lub inne nielogiczne. Domyslny upper bound to dzisiaj, zeby OCR-mangled daty nie zalaly DESC sort. Weryfikuj sygnature i date w zrodle (saos.org.pl/judgments/{id}).
 - **Bez modyfikacji tresci** - zwracamy verbatim z SAOS. NIE prosc o parafraze "lepszym jezykiem" - to wartosc dowodowa.
-- **Stateless, bez cache PII** - kazde wywolanie idzie do upstream API. NIE polegaj na ciaglosci sesji - klient (Patron) sam zarzadza cache i retencja.
+- **Zrodlo danych** - lokalna kopia dumpu SAOS (pelna baza, aktualizacja przyrostowa raz dziennie - orzeczenia opublikowane w SAOS dzisiaj moga pojawic sie jutro). Gdy lokalnie brak wyniku, serwer pyta API SAOS; wynik z API ma \`structuredContent.source\` = \`saos_api_fallback\` i adnotacje w tekscie. NIE polegaj na ciaglosci sesji.
 - **\`structuredContent.citations\`** zawsze wypelnione: title, url (saos.org.pl/judgments/{id}), case_number, court, judgment_date, snippet. Cytuj te citations w odpowiedzi koncowej.
 
 ## Iteracja po bledach
@@ -882,8 +786,9 @@ const VALID_COURT_TYPES = new Set([
   "NATIONAL_APPEAL_CHAMBER",
 ]);
 
+function createServer(): Server {
 const server = new Server(
-  { name: "mcp-saos", version: "1.2.0" }, // keep in sync with package.json "version"
+  { name: "mcp-saos", version: "1.3.0" }, // keep in sync with package.json "version"
   { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
 );
 
@@ -909,7 +814,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             "invalid_court_type"
           );
         }
-        const raw = await saosSearch({
+        const { data: raw, source } = await searchJudgments({
           all: a.all as string | undefined,
           caseNumber: a.caseNumber as string | undefined,
           courtType: a.courtType as string | undefined,
@@ -920,10 +825,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           judgmentDateTo: a.dateTo as string | undefined,
           pageSize: a.pageSize as number | undefined,
           pageNumber: a.pageNumber as number | undefined,
-        });
+        }, "search");
         return {
-          content: [{ type: "text", text: formatSearchResults(raw) }],
-          structuredContent: { citations: buildSearchCitations(raw) },
+          content: [{ type: "text", text: withSourceNote(formatSearchResults(raw), source) }],
+          structuredContent: { citations: buildSearchCitations(raw), source },
         };
       }
 
@@ -931,7 +836,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!a.id) {
           return errorResult("parametr 'id' jest wymagany.", "missing_arg");
         }
-        const raw = await saosGetJudgment(a.id as string | number);
+        const { data: raw, source } = await getJudgment(a.id as string | number, "get_judgment");
         if (!raw || (typeof raw === "object" && Object.keys(raw).length === 0)) {
           return errorResult(
             `Orzeczenie ID ${a.id} nie znalezione w SAOS. Sprawdz ID przez 'search' / 'search_by_case' lub czy nie jest to sad administracyjny (WSA/NSA - uzyj mcp-nsa).`,
@@ -940,8 +845,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         const citation = buildJudgmentCitation(raw);
         return {
-          content: [{ type: "text", text: formatJudgment(raw) }],
-          structuredContent: { citations: citation ? [citation] : [] },
+          content: [{ type: "text", text: withSourceNote(formatJudgment(raw), source) }],
+          structuredContent: { citations: citation ? [citation] : [], source },
         };
       }
 
@@ -949,13 +854,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!a.caseNumber) {
           return errorResult("parametr 'caseNumber' jest wymagany.", "missing_arg");
         }
-        const raw = await saosSearch({
+        const { data: raw, source } = await searchJudgments({
           caseNumber: a.caseNumber as string,
           pageSize: PAGE_SIZE_DEFAULT,
-        });
+        }, "search_by_case");
         return {
-          content: [{ type: "text", text: formatSearchResults(raw) }],
-          structuredContent: { citations: buildSearchCitations(raw) },
+          content: [{ type: "text", text: withSourceNote(formatSearchResults(raw), source) }],
+          structuredContent: { citations: buildSearchCitations(raw), source },
         };
       }
 
@@ -978,15 +883,139 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+return server;
+}
+
+// ---------------------------------------------------------------------------
+// Dump sync scheduler (HTTP mode, or SAOS_SYNC=1): runs dist/sync.js as a child
+// process - first the resumable full download, then once a day (SAOS_SYNC_AT,
+// default 03:30 container time) the incremental update.
+// ---------------------------------------------------------------------------
+
+let syncRunning = false;
+let lastSyncAttempt = 0;
+
+function runSync(): void {
+  syncRunning = true;
+  lastSyncAttempt = Date.now();
+  const child = spawn(process.execPath, [join(__dirname, "sync.js")], { stdio: "inherit" });
+  child.on("exit", (code) => {
+    syncRunning = false;
+    process.stderr.write(`mcp-saos: sync finished with code ${code}\n`);
+  });
+}
+
+function syncDue(): boolean {
+  if (syncRunning) return false;
+  const store = localStore();
+  // No mirror yet / full download unfinished: (re)start, retry 15 min after a failure.
+  if (!store || !store.isReady()) return Date.now() - lastSyncAttempt > 15 * 60 * 1000;
+  const [h, m] = (process.env.SAOS_SYNC_AT ?? "03:30").split(":").map(Number);
+  const now = new Date();
+  const dueAt = new Date(now);
+  dueAt.setHours(h, m, 0, 0);
+  if (now < dueAt) dueAt.setDate(dueAt.getDate() - 1);
+  const last = Date.parse(store.getState("last_sync") ?? "") || 0;
+  return last < dueAt.getTime() && Date.now() - lastSyncAttempt > 60 * 60 * 1000;
+}
+
+function startScheduler(): void {
+  const tick = () => {
+    if (syncDue()) runSync();
+  };
+  tick();
+  setInterval(tick, 60 * 1000).unref();
+}
+
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
+function readBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > 1_000_000) {
+        reject(new Error("body too large"));
+        req.destroy();
+      } else chunks.push(c);
+    });
+    req.on("end", () => {
+      try {
+        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf-8")) : undefined);
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", ...headers }).end(JSON.stringify(body));
+}
+
+async function startHttp(): Promise<void> {
+  const { StreamableHTTPServerTransport } = await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
+  const port = Number(process.env.PORT ?? 8000);
+  const mcpPath = process.env.MCP_HTTP_PATH ?? "/mcp";
+
+  const http = createHttpServer(async (req, res) => {
+    const path = (req.url ?? "/").split("?")[0];
+    if (path === "/healthz") {
+      res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
+      return;
+    }
+    if (path === "/status") {
+      const store = localStore();
+      sendJson(res, 200, store ? { ...store.stats(), sync_running: syncRunning } : { local: false, sync_running: syncRunning });
+      return;
+    }
+    if (path !== mcpPath) {
+      sendJson(res, 404, { error: "not found" });
+      return;
+    }
+    if (req.method !== "POST") {
+      // Stateless server: no SSE stream (GET) and no sessions to delete.
+      sendJson(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }, { Allow: "POST" });
+      return;
+    }
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+    try {
+      const body = await readBody(req);
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } catch (err) {
+      if (!res.headersSent) {
+        sendJson(res, 500, { jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+      }
+      process.stderr.write(`mcp-saos: request failed: ${String(err)}\n`);
+    }
+  });
+  http.listen(port, "0.0.0.0", () => {
+    process.stderr.write(`mcp-saos server started (Streamable HTTP on :${port}${mcpPath})\n`);
+  });
+}
+
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  // Log to stderr only - stdout is reserved for MCP JSON-RPC protocol
-  process.stderr.write("mcp-saos server started (stdio transport)\n");
+  if (process.env.MCP_TRANSPORT === "http") {
+    await startHttp();
+  } else {
+    const transport = new StdioServerTransport();
+    await createServer().connect(transport);
+    // Log to stderr only - stdout is reserved for MCP JSON-RPC protocol
+    process.stderr.write("mcp-saos server started (stdio transport)\n");
+  }
+  if (process.env.MCP_TRANSPORT === "http" ? process.env.SAOS_SYNC !== "0" : process.env.SAOS_SYNC === "1") {
+    startScheduler();
+  }
 }
 
 main().catch((err) => {
