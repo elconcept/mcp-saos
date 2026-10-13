@@ -52,8 +52,8 @@ function phrase(toks: string[]): string {
 }
 
 /**
- * Free-text query -> FTS5 expression. "quoted phrases" match exactly, other
- * words are stemmed prefixes, all ANDed; OR (upper case) between two items and
+ * Free-text query -> FTS5 expression. "quoted phrases" match adjacent words
+ * (inflected), other words are stemmed prefixes, all ANDed; OR (upper case) between two items and
  * a leading "-" (NOT) are honoured. Returns null when nothing searchable is left.
  */
 export function buildTextQuery(input: string, stem = true): string | null {
@@ -65,8 +65,10 @@ export function buildTextQuery(input: string, stem = true): string | null {
     let expr: string | null = null;
     let negate = false;
     if (m[2] !== undefined) {
+      // Phrase with inflected words, like SAOS: "zadoscuczyn* + za + krzywd*"
+      // (FTS5 "a + b" = adjacent tokens; digits and short words stay exact).
       const t = tokens(m[2]);
-      if (t.length) expr = phrase(t);
+      if (t.length) expr = stem ? t.map(stemTerm).join(" + ") : phrase(t);
       negate = m[1] === "-";
     } else {
       const raw = m[3];

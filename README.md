@@ -148,7 +148,7 @@ search API on every request:
   returned with `structuredContent.source = "saos_api_fallback"`, annotated in the text and recorded in the
   `discrepancies` table (visible at `GET /status`).
 - Full-text: unquoted words are prefix-matched after removing the Polish inflection ending, `"quoted phrases"` match
-  exactly, `-word` excludes, `OR` alternates. Order: judgment date DESC, as in SAOS.
+  adjacent words (inflected forms too, as in SAOS), `-word` excludes, `OR` alternates. Order: judgment date DESC, as in SAOS.
 
 | Variable | Default | Meaning |
 |---|---|---|

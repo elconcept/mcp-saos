@@ -19,7 +19,7 @@ Lokalna kopia dumpu SAOS jako silnik wyszukiwania (fork elconcept). **Backward-c
 
 ### Changed
 
-- Wyszukiwanie lokalne: slowa bez cudzyslowu sa skracane o koncowke fleksyjna i szukane prefiksowo (`umowa` -> `umow*`), frazy w cudzyslowie dokladnie, `-slowo` wyklucza, `OR` laczy. Wyniki moga sie roznic od Solr SAOS (inny stemming); kolejnosc jak w SAOS (data DESC).
+- Wyszukiwanie lokalne: slowa bez cudzyslowu sa skracane o koncowke fleksyjna i szukane prefiksowo (`umowa` -> `umow*`), frazy w cudzyslowie jako sasiadujace slowa (tez odmienione, jak w SAOS), `-slowo` wyklucza, `OR` laczy. Wyniki moga sie roznic od Solr SAOS (inny stemming); kolejnosc jak w SAOS (data DESC).
 
 ## [1.2.0] - 2026-07-13
 

@@ -108,7 +108,10 @@ async function runWindow(store: Store, start: string, end: string, retried = fal
   }
   const expected = await upstreamCount(start, end);
   const local = localCount(store, start, end);
-  if (local < expected && !retried) {
+  // The search index keeps stale dates for a few judgments (they sit in a
+  // neighbouring window locally), so a shortfall of a handful is expected;
+  // only a real gap (lost pages) triggers a second download.
+  if (local < expected - Math.max(10, expected * 0.005) && !retried) {
     log(`window ${start}..${end}: local ${local} < upstream ${expected}, downloading again`);
     save.run(0, 0, start);
     return runWindow(store, start, end, true);
