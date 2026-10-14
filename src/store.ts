@@ -12,6 +12,7 @@
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { createHash } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
 import { stripHtml } from "./text.js";
 
@@ -35,6 +36,28 @@ const ID_SPAN = 10_000_000;
 export function dateKey(date: string | undefined): number {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date ?? "");
   return m ? Number(m[1] + m[2] + m[3]) : 0;
+}
+
+/**
+ * Strict ISO calendar-date check (F-07). dateKey() returns 0 for garbage,
+ * which silently disabled the date filter - callers must validate FIRST and
+ * return `invalid_date` (fault=caller) instead of querying.
+ */
+export function isValidIsoDate(s: string | undefined): s is string {
+  if (typeof s !== "string") return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return false;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (y < 1000 || y > 9999 || mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+/** F-04: one-way hash for diagnostics - raw queries never leave the process. */
+export function hashParams(params: unknown): string {
+  return createHash("sha256").update(JSON.stringify(params) ?? "", "utf-8").digest("hex").slice(0, 16);
 }
 
 export function ftsRowid(id: number, date: string | undefined): number {
@@ -95,18 +118,37 @@ export class Store {
         CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS windows (
           start TEXT PRIMARY KEY, end TEXT NOT NULL, next_page INTEGER NOT NULL DEFAULT 0,
-          fetched INTEGER NOT NULL DEFAULT 0, expected INTEGER, completed_at TEXT
+          fetched INTEGER NOT NULL DEFAULT 0, expected INTEGER, completed_at TEXT,
+          status TEXT NOT NULL DEFAULT 'retry_pending', shortfall INTEGER, checked_at TEXT
         );
         CREATE TABLE IF NOT EXISTS discrepancies (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, tool TEXT NOT NULL,
           params TEXT NOT NULL, upstream_total INTEGER, upstream_ids TEXT
         );
       `);
+      // Migrate pre-1.4.0 mirrors (F-03): new window-status columns.
+      for (const col of [
+        "ALTER TABLE windows ADD COLUMN status TEXT NOT NULL DEFAULT 'retry_pending'",
+        "ALTER TABLE windows ADD COLUMN shortfall INTEGER",
+        "ALTER TABLE windows ADD COLUMN checked_at TEXT",
+      ]) {
+        try {
+          this.db.exec(col);
+        } catch {
+          /* column already exists */
+        }
+      }
     }
   }
 
   private stmt(sql: string): StatementSync {
     return (this.st[sql] ??= this.db.prepare(sql));
+  }
+
+  close(): void {
+    this.st = {};
+    this.divCache.clear();
+    this.db.close();
   }
 
   // --- state ---------------------------------------------------------------
@@ -228,19 +270,77 @@ export class Store {
 
   stats() {
     const one = (sql: string) => (this.stmt(sql).get() as { n: number | null }).n;
+    const winStatus = (s: string) => {
+      try {
+        return one(`SELECT count(*) AS n FROM windows WHERE status = '${s}'`);
+      } catch {
+        return null;
+      }
+    };
+    // F-04: public diagnostics NEVER carry raw query params or upstream ids
+    // (PII / query-content leak via GET /status). Only hashes + counts.
+    let recent: Array<Record<string, unknown>> = [];
+    try {
+      const rows = this.stmt(
+        "SELECT at, tool, params, upstream_total, upstream_ids FROM discrepancies ORDER BY id DESC LIMIT 20"
+      ).all() as Array<{ at: string; tool: string; params: string; upstream_total: number; upstream_ids: string }>;
+      recent = rows.map((r) => ({
+        at: r.at,
+        tool: r.tool,
+        params_hash: hashParams(r.params),
+        upstream_total: r.upstream_total,
+        upstream_ids_count: r.upstream_ids ? r.upstream_ids.split(",").filter(Boolean).length : 0,
+      }));
+    } catch {
+      recent = [];
+    }
     return {
       judgments: one("SELECT count(*) AS n FROM judgments"),
       divisions: one("SELECT count(*) AS n FROM divisions"),
       windows_total: one("SELECT count(*) AS n FROM windows"),
       windows_done: one("SELECT count(*) AS n FROM windows WHERE completed_at IS NOT NULL"),
+      windows_verified: winStatus("verified"),
+      windows_degraded: winStatus("degraded"),
+      windows_failed: winStatus("failed"),
       discrepancies: one("SELECT count(*) AS n FROM discrepancies"),
       initial_complete: this.isReady(),
       last_sync: this.getState("last_sync"),
       last_sync_result: this.getState("last_sync_result"),
       upstream_total_at_full_sync: this.getState("upstream_total"),
-      recent_discrepancies: this.stmt(
-        "SELECT at, tool, params, upstream_total, upstream_ids FROM discrepancies ORDER BY id DESC LIMIT 20"
-      ).all(),
+      index_status: this.mirrorIntegrity().status,
+      recent_discrepancies: recent,
     };
+  }
+
+  /**
+   * F-02: mirror completeness audit - distinguishes complete / partial /
+   * stale / unverified WITHOUT querying the API per request (sampling is
+   * done by sync + discrepancy logging, this only aggregates).
+   */
+  mirrorIntegrity(): {
+    status: "complete" | "partial" | "stale" | "unverified";
+    detail: string;
+  } {
+    if (!this.isReady()) return { status: "unverified", detail: "initial sync not complete" };
+    const one = (sql: string) => {
+      try {
+        return (this.stmt(sql).get() as { n: number | null }).n ?? 0;
+      } catch {
+        return 0;
+      }
+    };
+    const total = one("SELECT count(*) AS n FROM windows");
+    const degraded = one("SELECT count(*) AS n FROM windows WHERE status = 'degraded'");
+    const failed = one("SELECT count(*) AS n FROM windows WHERE status = 'failed'");
+    const pending = one("SELECT count(*) AS n FROM windows WHERE completed_at IS NULL");
+    if (failed > 0 || pending > 0)
+      return { status: "partial", detail: `${failed} failed, ${pending} pending of ${total} windows` };
+    if (degraded > 0)
+      return { status: "partial", detail: `${degraded} degraded of ${total} windows` };
+    const last = Date.parse(this.getState("last_sync") ?? "") || 0;
+    if (Date.now() - last > 72 * 3600 * 1000)
+      return { status: "stale", detail: "last sync over 72h ago" };
+    if (total === 0) return { status: "unverified", detail: "no window data" };
+    return { status: "complete", detail: `${total} windows verified` };
   }
 }

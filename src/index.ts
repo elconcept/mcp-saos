@@ -34,6 +34,8 @@ import {
   buildCaseNumberRegex,
   scanWindows,
   computeVerdict,
+  attitudeForLabel,
+  isSelfDescription,
   VERDICT_TEXT,
   CITE_CHECK_DISCLAIMER,
   type ScanHit,
@@ -44,8 +46,21 @@ import {
   getJudgment,
   localStore,
   PAGE_SIZE_DEFAULT,
+  PAGE_SIZE_MIN,
   type Source,
 } from "./engine.js";
+import { isValidIsoDate } from "./store.js";
+import {
+  classifyHttpError,
+  HttpError,
+  type UpstreamFault,
+} from "./http.js";
+
+export const JUDGMENT_CHUNK_DEFAULT = 2000;
+export const JUDGMENT_CHUNK_MAX = 20000;
+const PKG_VERSION = "1.4.0"; // keep in sync with package.json "version"
+const BUILD_VERSION = process.env.BUILD_VERSION ?? PKG_VERSION;
+const GIT_COMMIT = process.env.GIT_COMMIT ?? "unknown";
 
 // ---------------------------------------------------------------------------
 // Response formatters
@@ -72,22 +87,54 @@ interface SearchResponse {
   links?: Array<{ rel?: string; href?: string }>;
 }
 
-function formatSearchResults(raw: unknown): string {
+export function formatSearchResults(
+  raw: unknown,
+  pageNumber: number,
+  pageSize: number,
+): { text: string; pagination: Pagination } {
   const data = raw as SearchResponse;
   const items = data.items ?? [];
   const total = data.info?.totalResults ?? 0;
+  const totalPages = pageSize > 0 ? Math.ceil(total / pageSize) : 0;
+  const hasMore = (pageNumber + 1) * pageSize < total;
+  const pagination: Pagination = {
+    pageNumber,
+    pageSize,
+    totalResults: total,
+    totalPages,
+    hasMore,
+    nextPage: hasMore ? pageNumber + 1 : null,
+  };
+
+  // F-08: out-of-range page is NOT "no judgments" - report the real total.
+  if (items.length === 0 && total > 0) {
+    return {
+      text:
+        `Strona poza zakresem: pageNumber=${pageNumber}, pageSize=${pageSize}, ` +
+        `lacznie wynikow: ${total} (stron: ${totalPages}). ` +
+        `Ustaw pageNumber 0..${Math.max(0, totalPages - 1)}.\n\n` +
+        "Uwaga: pokrycie SAOS jest nierowne wg typu sadu. Sady administracyjne " +
+        "(WSA/NSA) nie sa indeksowane - dla orzeczen administracyjnych uzyj " +
+        "orzeczenia.nsa.gov.pl.",
+      pagination,
+    };
+  }
 
   if (items.length === 0) {
-    return (
-      "Brak wynikow w bazie SAOS dla podanych kryteriow.\n\n" +
-      "Uwaga: pokrycie SAOS jest nierowne wg typu sadu. Sady administracyjne " +
-      "(WSA/NSA) nie sa indeksowane - dla orzeczen administracyjnych uzyj " +
-      "orzeczenia.nsa.gov.pl. Sprobuj tez innych slow kluczowych lub szerszego zakresu dat."
-    );
+    return {
+      text:
+        "Brak wynikow w bazie SAOS dla podanych kryteriow (totalResults=0).\n\n" +
+        "Uwaga: pokrycie SAOS jest nierowne wg typu sadu. Sady administracyjne " +
+        "(WSA/NSA) nie sa indeksowane - dla orzeczen administracyjnych uzyj " +
+        "orzeczenia.nsa.gov.pl. Sprobuj tez innych slow kluczowych lub szerszego zakresu dat.",
+      pagination,
+    };
   }
 
   const lines: string[] = [
-    `Znalezione: ${total} orzeczen (pokazano ${items.length}).`,
+    `Znalezione: ${total} orzeczen (pokazano ${items.length}, strona ${pageNumber}/${Math.max(1, totalPages)}, rozmiar ${pageSize}).`,
+    "Fraza w cudzyslowie = dokladne sasiadujace slowa (6 wynikow dla frazy); bez cudzyslowu = slowa " +
+      "laczone AND z odmiana (127 wynikow dla tej samej frazy). To nie blad - wybierz skladnie swiadomie.",
     "Uwaga: daty bywaja znieksztalcone przez OCR (np. rok 3013) - przy " +
       "sortowaniu wg daty weryfikuj sygnature i date w zrodle. Sady " +
       "administracyjne (WSA/NSA) nie sa w SAOS.",
@@ -117,11 +164,19 @@ function formatSearchResults(raw: unknown): string {
 
   // Next page hint
   const hasNext = (data.links ?? []).some((l) => l.rel === "next");
-  if (hasNext && items.length < total) {
-    lines.push("Wiecej wynikow - zwieksz pageNumber o 1.");
+  if ((hasNext || pagination.hasMore) && items.length < total) {
+    lines.push(`Wiecej wynikow - wywolaj ponownie z pageNumber=${pageNumber + 1}.`);
   }
 
-  return lines.join("\n");
+  return { text: lines.join("\n"), pagination };
+}
+
+export interface Pagination {
+  pageNumber: number;  pageSize: number;
+  totalResults: number;
+  totalPages: number;
+  hasMore: boolean;
+  nextPage: number | null;
 }
 
 interface JudgmentData {
@@ -140,7 +195,22 @@ interface JudgmentData {
   referencedRegulations?: Array<{ text?: string }>;
 }
 
-function formatJudgment(raw: unknown): string {
+export interface JudgmentChunk {
+  text: string;
+  totalLength: number;
+  returnedLength: number;
+  offset: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+  truncated: boolean;
+}
+
+/**
+ * F-01: chunked judgment reads. Default (offset=0, limit=2000) returns exactly
+ * what 1.3.x returned; larger limit / follow-up offsets reconstruct the whole
+ * text with no gaps or overlaps (concat chunks in order).
+ */
+export function formatJudgment(raw: unknown, offset = 0, limit = JUDGMENT_CHUNK_DEFAULT): JudgmentChunk {
   const d = raw as JudgmentData;
   const sig = d.courtCases?.[0]?.caseNumber ?? "brak_sygnatury";
   const courtName =
@@ -167,8 +237,11 @@ function formatJudgment(raw: unknown): string {
 
   const summary = stripHtml(d.summary ?? "").slice(0, 800);
   const textRaw = stripHtml(d.textContent ?? "");
-  // Return up to 2000 chars of the judgment text
-  const textPreview = textRaw.slice(0, 2000);
+  const totalLength = textRaw.length;
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const safeLimit = Math.min(JUDGMENT_CHUNK_MAX, Math.max(1, Math.floor(limit)));
+  const chunk = textRaw.slice(safeOffset, safeOffset + safeLimit);
+  const hasMore = safeOffset + safeLimit < totalLength;
 
   const lines: string[] = [
     "=== ORZECZENIE SAOS ===",
@@ -193,18 +266,28 @@ function formatJudgment(raw: unknown): string {
     lines.push("", "--- Streszczenie ---", summary);
   }
 
-  if (textPreview) {
+  if (chunk || safeOffset === 0) {
     lines.push(
       "",
-      `--- Tresc (pierwsze 2000 znakow z ${textRaw.length} lacznie) ---`,
-      textPreview
+      `--- Tresc (znaki ${safeOffset}-${safeOffset + chunk.length} z ${totalLength} lacznie) ---`,
+      chunk
     );
-    if (textRaw.length > 2000) {
-      lines.push(`[...] Skrocono. Pelna tresc: ${saosUrl}`);
+    if (hasMore) {
+      lines.push(`[...] Skrocono. Nastepny fragment: get_judgment(id=${d.id}, offset=${safeOffset + safeLimit}, limit=${safeLimit}). Pelna tresc: ${saosUrl}`);
     }
+  } else {
+    lines.push("", `[offset ${safeOffset} poza zakresem - tekst liczy ${totalLength} znakow]`);
   }
 
-  return lines.join("\n");
+  return {
+    text: lines.join("\n"),
+    totalLength,
+    returnedLength: chunk.length,
+    offset: safeOffset,
+    hasMore,
+    nextOffset: hasMore ? safeOffset + safeLimit : null,
+    truncated: hasMore,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +396,7 @@ interface CiteHitOut {
   citing_date?: string;
   citing_court?: string;
   severity: string;
+  attitude: string;
   label: string;
   phrase: string;
   fragment: string;
@@ -329,6 +413,24 @@ function itemCourtName(it: JudgmentItem): string {
 
 function isValidDate(d: string | undefined): d is string {
   return typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d);
+}
+
+/**
+ * F-05: pure coverage arithmetic for the citator (exported for tests).
+ * total/loaded come from the citing-query page, scanned from deepScan.
+ */
+export function citeCoverage(
+  totalCandidates: number,
+  loadedCandidates: number,
+  scannedFullText: number,
+  citingOnPage: number,
+  maxScan: number,
+  deepScan: boolean,
+): { unexaminedCandidates: number; analysisComplete: boolean; status: "complete" | "partial" } {
+  const unexaminedCandidates = Math.max(0, totalCandidates - loadedCandidates);
+  const analysisComplete =
+    unexaminedCandidates === 0 && (!deepScan || citingOnPage <= scannedFullText || citingOnPage <= maxScan);
+  return { unexaminedCandidates, analysisComplete, status: analysisComplete ? "complete" : "partial" };
 }
 
 /** Exact-match test: does this item's case number equal the target signature? */
@@ -388,10 +490,14 @@ async function runCiteCheck(a: Record<string, unknown>) {
   const targetDate = target && isValidDate(target.judgmentDate) ? target.judgmentDate : null;
 
   // 2. Later judgments citing the signature - quoted full-text phrase search.
-  const citingRes = await searchJudgments({ all: `"${caseNo}"`, pageSize: 100 }, "saos_cite_check");
+  // F-05: citator pages through citing judgments (pageNumber, 100/page);
+  // analysis beyond the loaded page is reported as unexamined, not verdict.
+  const citePage = Math.max(0, Math.floor(typeof a.pageNumber === "number" ? a.pageNumber : 0));
+  const citingRes = await searchJudgments({ all: `"${caseNo}"`, pageSize: 100, pageNumber: citePage }, "saos_cite_check");
   sources.add(citingRes.source);
   const citingRaw = citingRes.data as SearchResponse;
   const totalCitingRaw = citingRaw.info?.totalResults ?? 0;
+  const loadedRaw = (citingRaw.items ?? []).length;
 
   const citing = (citingRaw.items ?? [])
     .filter((it) => it.id !== undefined)
@@ -404,8 +510,22 @@ async function runCiteCheck(a: Record<string, unknown>) {
   //    One hit per (judgment, phrase label); a deep_scan hit replaces the
   //    snippet-based one for the same key (fuller fragment context).
   const hitMap = new Map<string, CiteHitOut>();
-  const addHits = (it: JudgmentItem, scanned: ScanHit[], source: CiteHitOut["source"]) => {
+  const addHits = (
+    it: JudgmentItem,
+    scanned: ScanHit[],
+    source: CiteHitOut["source"],
+    targetDateForFilter: string | null,
+  ) => {
     for (const h of scanned) {
+      // F-06: an enlarged-panel phrase that only re-describes the EXAMINED
+      // judgment itself is not downstream evidence - drop it.
+      if (
+        h.severity === "caution" &&
+        (h.label === "uchwala_skladu_siedmiu" || h.label === "uchwala_pelnego_skladu") &&
+        isSelfDescription(h.fragment, caseNo, targetDateForFilter ?? undefined)
+      ) {
+        continue;
+      }
       const key = `${it.id}:${h.label}`;
       const existing = hitMap.get(key);
       if (existing && !(existing.source === "search_snippet" && source === "deep_scan")) continue;
@@ -415,6 +535,7 @@ async function runCiteCheck(a: Record<string, unknown>) {
         citing_date: it.judgmentDate,
         citing_court: itemCourtName(it),
         severity: h.severity,
+        attitude: attitudeForLabel(h.label, h.severity),
         label: h.label,
         phrase: h.phrase,
         fragment: h.fragment,
@@ -424,7 +545,7 @@ async function runCiteCheck(a: Record<string, unknown>) {
   };
 
   for (const it of citing) {
-    if (it.textContent) addHits(it, scanWindows(it.textContent, caseNo), "search_snippet");
+    if (it.textContent) addHits(it, scanWindows(it.textContent, caseNo), "search_snippet", targetDate);
   }
 
   // 4. Deep scan: fetch full texts of the most decisive citing judgments
@@ -459,16 +580,28 @@ async function runCiteCheck(a: Record<string, unknown>) {
       details.forEach((d, idx) => {
         if (!d?.textContent) return;
         scannedDeep++;
-        addHits(batch[idx], scanWindows(d.textContent, caseNo), "deep_scan");
+        addHits(batch[idx], scanWindows(d.textContent, caseNo), "deep_scan", targetDate);
       });
     }
   }
 
   // 5. Verdict + output.
+  // F-05: explicit coverage - never present a 1.9% scan as a full analysis.
   const hits = [...hitMap.values()];
   const verdict = computeVerdict(citing.length, hits);
   const strongHits = hits.filter((h) => h.severity === "strong");
   const cautionHits = hits.filter((h) => h.severity === "caution");
+  const totalCandidates = totalCitingRaw;
+  const loadedCandidates = loadedRaw;
+  const scannedFullText = scannedDeep;
+  const { unexaminedCandidates, analysisComplete, status: analysisStatus } = citeCoverage(
+    totalCandidates,
+    loadedCandidates,
+    scannedFullText,
+    citing.length,
+    maxScan,
+    deepScan,
+  );
 
   const lines: string[] = [`=== CITATOR SAOS: ${caseNo} ===`, ""];
   if (target) {
@@ -490,11 +623,22 @@ async function runCiteCheck(a: Record<string, unknown>) {
   }
   lines.push("");
   lines.push(`WERDYKT [${verdict}]: ${VERDICT_TEXT[verdict]}`);
+  if (analysisStatus === "partial") {
+    lines.push(
+      "ANALIZA CZESCIOWA - werdykt dotyczy tylko zbadanej probki; " +
+        "przed powolaniem orzeczenia przejrzyj kolejne strony (pageNumber+1) i zwieksz maxScan."
+    );
+  }
   lines.push("");
   lines.push(
     `Cytujace orzeczenia${targetDate ? " (pozniejsze niz " + targetDate + ")" : ""}: ` +
       `${citing.length} na tej stronie (lacznie w SAOS dla frazy: ${totalCitingRaw}), ` +
       `skan pelnych tekstow: ${scannedDeep}.`
+  );
+  lines.push(
+    `Pokrycie: totalCandidates=${totalCandidates}, loadedCandidates=${loadedCandidates}, ` +
+      `scannedFullText=${scannedFullText}, unexaminedCandidates=${unexaminedCandidates}, ` +
+      `analysis=${analysisStatus}, strona cytowan=${citePage}.`
   );
 
   if (hits.length > 0) {
@@ -541,6 +685,14 @@ async function runCiteCheck(a: Record<string, unknown>) {
       total_citing_found: citing.length,
       total_citing_in_saos: totalCitingRaw,
       scanned_deep: scannedDeep,
+      // F-05 coverage block (new keys, old keys kept for compat).
+      totalCandidates,
+      loadedCandidates,
+      scannedFullText,
+      unexaminedCandidates,
+      analysisComplete,
+      status: analysisStatus,
+      citePage,
       hits,
       disclaimer: CITE_CHECK_DISCLAIMER,
       source: combineSources(sources),
@@ -563,11 +715,11 @@ const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy
 
 ### Szukanie orzecznictwa
 1. \`search_by_case\` - jesli uzytkownik podal sygnature akt (np. "I ACa 772/13", "IV CSK 123/15") - to skrot, najszybciej.
-2. \`search\` - szerokie szukanie po tresci, podstawie prawnej, sedzim, dacie, typie sadu. Zwraca paginowane wyniki (default 10/strona, max 100).
-3. \`get_judgment\` - pelne orzeczenie po ID numerycznym z wynikow search. Zwraca metadata + pierwsze 2000 znakow tresci.
+2. \`search\` - szerokie szukanie po tresci, podstawie prawnej, sedzim, dacie, typie sadu. Zwraca paginowane wyniki (default 10/strona, max 100). Fraza w cudzyslowie = scisle sasiadujace slowa; bez cudzyslowu = slowa laczone AND (wiecej wynikow). Strona poza zakresem zwraca totalResults i totalPages - odroznij od braku wynikow (totalResults=0).
+3. \`get_judgment\` - orzeczenie po ID numerycznym z wynikow search. Domyslnie metadata + pierwsze 2000 znakow tresci; parametry offset/limit (max 20000) skladaja caly tekst bez luk (nextOffset/hasMore w structuredContent).
 
 ### Citator - czy wyrok zyje
-4. \`saos_cite_check\` - podaj sygnature, dostaniesz: (a) pozniejsze orzeczenia cytujace ja (pelnotekstowo), (b) skan uzasadnien pod frazy przelamania linii orzeczniczej W OKNIE wokol sygnatury, (c) werdykt: \`przelamanie_wykryte\` / \`uchwala_skladu_powiekszonego\` / \`nadal_cytowany\` / \`brak_cytowan_w_saos\`. Uzywaj PRZED zacytowaniem orzeczenia jako aktualnego. Werdykt to heurystyka - przy \`przelamanie_wykryte\` ZAWSZE zweryfikuj pelny tekst trafienia przez \`get_judgment\`. Brak trafien NIE potwierdza aktualnosci (pokrycie SAOS nierowne).
+4. \`saos_cite_check\` - podaj sygnature, dostaniesz: (a) pozniejsze orzeczenia cytujace ja (pelnotekstowo, stronicowane pageNumber), (b) skan uzasadnien pod frazy przelamania linii orzeczniczej W OKNIE wokol sygnatury, (c) werdykt: \`przelamanie_wykryte\` / \`uchwala_skladu_powiekszonego\` / \`nadal_cytowany\` / \`brak_cytowan_w_saos\` + status pokrycia complete/partial (totalCandidates/loadedCandidates/scannedFullText/unexaminedCandidates). Fraza opisujaca SAMO badane orzeczenie jako uchwale skladu powiekszonego NIE liczy sie jako przelamanie - wymagany jest inny sklad lub zagadnienie prawne. Kazde trafienie ma attitude: mentioned/followed/distinguished/criticized/potentially_overruled/unknown. Uzywaj PRZED zacytowaniem orzeczenia jako aktualnego. Werdykt to heurystyka - przy \`przelamanie_wykryte\` ZAWSZE zweryfikuj pelny tekst trafienia przez \`get_judgment\`. Brak trafien NIE potwierdza aktualnosci (pokrycie SAOS nierowne).
 
 ## Twarde ograniczenia
 
@@ -579,10 +731,13 @@ const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy
 
 ## Iteracja po bledach
 
-Tool zwraca \`isError: true\` + tekst z prefixem \`[code]\`. Typowe kody:
+Tool zwraca \`isError: true\` + tekst z prefixem \`[code]\` + structuredContent {error_code, fault, retryable, status?, retry_after_s?}. Typowe kody:
 - \`missing_arg\` - brakujacy wymagany parametr (np. id w get_judgment, caseNumber w search_by_case). Przeczytaj inputSchema.
-- \`not_found\` - orzeczenie/sygnatura nie ma w SAOS. Sprobuj szerszej daty / innej sygnatury, lub czy to nie WSA/NSA (osobny konektor).
-- \`upstream_error\` - blad komunikacji z API SAOS (HTTP 5xx, timeout 40s). Retry raz przed surface do uzytkownika.
+- \`invalid_arg\` - niepoprawna wartosc argumentu (np. id "abc"/0/ujemne, zly typ). fault=caller, retryable=false. Nie myl z upstream_error.
+- \`invalid_date\` - data spoza formatu ISO YYYY-MM-DD albo niekalendarzowa (np. "xyz", "2021-13-40"). fault=caller. Zla data NIGDY nie jest ignorowana ani nie daje falszywego zera.
+- \`not_found\` - orzeczenie/sygnatura nie ma w SAOS (takze HTTP 404 upstream). Sprobuj szerszej daty / innej sygnatury, lub czy to nie WSA/NSA (osobny konektor).
+- \`page_out_of_range\` - strona poza zakresem przy totalResults>0 i pustych items. Odpowiedz zawiera pagination z totalResults/totalPages/nextPage. Popraw pageNumber zamiast zmieniac filtry.
+- \`upstream_error\` - blad komunikacji z API SAOS (HTTP 5xx, timeout 40s, 429, 401/403 bez retry). fault=upstream/network, retryable per structuredContent, retry_after_s przy 429. Awaria SAOS to NIE pusty wynik. Retry raz przed surface do uzytkownika.
 - \`invalid_court_type\` - klient podal \`ADMINISTRATIVE\` lub inny niedozwolony typ. Dozwolone: COMMON, SUPREME, CONSTITUTIONAL_TRIBUNAL, NATIONAL_APPEAL_CHAMBER.
 
 ## Styl odpowiedzi
@@ -614,7 +769,8 @@ const TOOLS = [
       "Daty bywaja znieksztalcone przez OCR - weryfikuj sygnature i date w zrodle. " +
       "Przydatny do: analizy linii orzeczniczej, precedensow, " +
       "wyszukiwania po tresci / sygnatuze / sedzim / podstawie prawnej. " +
-      "Bledy: `invalid_court_type` (zly enum), `upstream_error` (HTTP/timeout API).",
+      "Bledy: `invalid_court_type` (zly enum), `invalid_date` (zly format daty), " +
+      "`page_out_of_range` (strona poza zakresem przy totalResults>0), `upstream_error` (HTTP/timeout API).",
     inputSchema: {
       type: "object",
       properties: {
@@ -641,11 +797,16 @@ const TOOLS = [
         },
         referencedRegulation: {
           type: "string",
-          description: "Przywolany akt prawny, np. 'ustawa o ochronie danych osobowych'.",
+          description:
+            "Przywolany akt prawny (indeks referencedRegulations), np. 'ustawa o ochronie danych osobowych'. " +
+            "Szerszy niz legalBase - lapie kazde przywolanie aktu w tresci/metadanych.",
         },
         legalBase: {
           type: "string",
-          description: "Podstawa prawna, np. 'art. 415 kc' lub 'art. 6 RODO'.",
+          description:
+            "Podstawa prawna rozstrzygniecia (indeks legalBases - przepisy wskazane jako podstawa wyroku), " +
+            "np. 'art. 415 kc' lub 'art. 6 RODO'. Wezszy niz referencedRegulation: orzeczenie przywolujace " +
+            "przepis w uzasadnieniu, ale oparte na innej podstawie, NIE musi trafic do wynikow legalBase.",
         },
         dateFrom: {
           type: "string",
@@ -674,17 +835,30 @@ const TOOLS = [
     name: "get_judgment",
     annotations: READ_ONLY_ANNOTATIONS,
     description:
-      "Pobiera pelne orzeczenie z SAOS po jego numerycznym ID. " +
+      "Pobiera orzeczenie z SAOS po jego numerycznym ID. " +
       "Zwraca metadane (sygnatura, sad, data, sklad, podstawy prawne), " +
-      "streszczenie (jesli dostepne) oraz pierwsze 2000 znakow tresci. " +
+      "streszczenie (jesli dostepne) oraz fragment tresci (domyslnie pierwsze 2000 znakow; " +
+      "offset/limit do max 20000 skladaja caly tekst). " +
       "ID orzeczenia pochodzi z wynikow narzedzia 'search' lub 'search_by_case'. " +
-      "Bledy: `missing_arg` (brak id), `not_found` (id poza baza), `upstream_error`.",
+      "Bledy: `missing_arg` (brak id), `invalid_arg` (id nie-numeryczne/<=0, tez upstream 400), " +
+      "`not_found` (id poza baza, tez upstream 404), `upstream_error`.",
     inputSchema: {
       type: "object",
       properties: {
         id: {
           type: ["string", "number"],
           description: "Numeryczne ID orzeczenia w bazie SAOS, np. 352475 lub '31345'.",
+        },
+        offset: {
+          type: "number",
+          description: "Poczatek fragmentu tresci w znakach (od 0). Domyslnie 0.",
+          minimum: 0,
+        },
+        limit: {
+          type: "number",
+          description: "Dlugosc fragmentu w znakach (1-20000). Domyslnie 2000 (kompatybilnosc wstecz).",
+          minimum: 1,
+          maximum: 20000,
         },
       },
       required: ["id"],
@@ -720,7 +894,7 @@ const TOOLS = [
       "'nie podziela pogladu', 'traci moc uchwala', 'uchwala skladu siedmiu sedziow') " +
       "w oknie ~500 znakow wokol wystapienia sygnatury. " +
       "Werdykt: przelamanie_wykryte / uchwala_skladu_powiekszonego / nadal_cytowany / " +
-      "brak_cytowan_w_saos. To heurystyka - kazde trafienie ma fragment tekstu do " +
+      "brak_cytowan_w_saos + status pokrycia complete/partial. To heurystyka - kazde trafienie ma fragment tekstu do " +
       "recznej weryfikacji, a brak trafien NIE potwierdza aktualnosci orzeczenia. " +
       "Bledy: `missing_arg` (nieczytelna sygnatura), `invalid_court_type`, `upstream_error`.",
     inputSchema: {
@@ -753,6 +927,12 @@ const TOOLS = [
             "Czy pobierac pelne teksty cytujacych orzeczen (domyslnie true). " +
             "false = tylko szybki skan snippetow z wyszukiwarki.",
         },
+        pageNumber: {
+          type: "number",
+          description:
+            "Strona listy orzeczen cytujacych (100/strona, od 0). Do przegladania cytowan poza pierwsza setka.",
+          minimum: 0,
+        },
       },
       required: ["caseNumber"],
     },
@@ -767,16 +947,78 @@ const TOOLS = [
 // udokumentowany w INSTRUCTIONS i kazdy w errorResult() istnieje w typie.
 type ErrorCode =
   | "missing_arg"
+  | "invalid_arg"
+  | "invalid_date"
   | "not_found"
+  | "page_out_of_range"
   | "upstream_error"
   | "invalid_court_type";
 
-function errorResult(text: string, code: ErrorCode) {
+interface ErrorDetails {
+  fault?: "caller" | "upstream" | "network";
+  retryable?: boolean;
+  status?: number;
+  retry_after_s?: number;
+}
+
+function errorResult(text: string, code: ErrorCode, details: ErrorDetails = {}) {
+  const fault =
+    details.fault ?? (code === "missing_arg" || code === "invalid_arg" || code === "invalid_date" || code === "invalid_court_type" || code === "page_out_of_range" ? "caller" : "upstream");
+  const retryable = details.retryable ?? false;
   return {
     content: [{ type: "text" as const, text: `[${code}] ${text}` }],
-    structuredContent: { error_code: code },
+    structuredContent: {
+      error_code: code,
+      fault,
+      retryable,
+      ...(details.status !== undefined ? { status: details.status } : {}),
+      ...(details.retry_after_s !== undefined ? { retry_after_s: details.retry_after_s } : {}),
+    },
     isError: true,
   };
+}
+
+/** Map an upstream HttpError to a structured MCP error (F-09). */
+function upstreamErrorResult(err: unknown, fallbackMsg: string) {
+  const f: UpstreamFault = classifyHttpError(err);
+  const msg = err instanceof Error ? err.message : String(err);
+  if (f.code === "not_found") {
+    return errorResult(`Nie znaleziono w SAOS (${msg}). ${fallbackMsg}`, "not_found", {
+      fault: f.fault,
+      retryable: false,
+      status: f.status,
+    });
+  }
+  if (f.code === "invalid_arg") {
+    return errorResult(`Nieprawidlowy argument dla SAOS (${msg}).`, "invalid_arg", {
+      fault: "caller",
+      retryable: false,
+      status: f.status,
+    });
+  }
+  const retryNote =
+    f.status === 429
+      ? ` Odczekaj ${f.retryAfterS ?? "?"}s (Retry-After) i sprobuj ponownie.`
+      : "";
+  return errorResult(`Blad komunikacji z API SAOS: ${msg}.${retryNote} ${fallbackMsg}`, "upstream_error", {
+    fault: f.fault,
+    retryable: f.retryable,
+    ...(f.status !== undefined ? { status: f.status } : {}),
+    ...(f.retryAfterS !== undefined ? { retry_after_s: f.retryAfterS } : {}),
+  });
+}
+
+export function parseIdArg(v: unknown): { ok: true; id: number } | { ok: false; empty: boolean } {
+  if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) {
+    return { ok: false, empty: true };
+  }
+  const n = typeof v === "number" ? v : Number(String(v).trim());
+  if (!Number.isInteger(n) || n <= 0) return { ok: false, empty: false };
+  return { ok: true, id: n };
+}
+
+export function parseChunkArg(v: unknown, def: number): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : def;
 }
 
 const VALID_COURT_TYPES = new Set([
@@ -788,7 +1030,7 @@ const VALID_COURT_TYPES = new Set([
 
 function createServer(): Server {
 const server = new Server(
-  { name: "mcp-saos", version: "1.3.0" }, // keep in sync with package.json "version"
+  { name: "mcp-saos", version: PKG_VERSION }, // keep in sync with package.json "version"
   { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
 );
 
@@ -814,39 +1056,120 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             "invalid_court_type"
           );
         }
-        const { data: raw, source } = await searchJudgments({
-          all: a.all as string | undefined,
-          caseNumber: a.caseNumber as string | undefined,
-          courtType: a.courtType as string | undefined,
-          judgeName: a.judgeName as string | undefined,
-          referencedRegulation: a.referencedRegulation as string | undefined,
-          legalBase: a.legalBase as string | undefined,
-          judgmentDateFrom: a.dateFrom as string | undefined,
-          judgmentDateTo: a.dateTo as string | undefined,
-          pageSize: a.pageSize as number | undefined,
-          pageNumber: a.pageNumber as number | undefined,
-        }, "search");
+        // F-07: invalid dates are caller errors - never silent filter drops.
+        for (const k of ["dateFrom", "dateTo"] as const) {
+          if (a[k] !== undefined && !isValidIsoDate(a[k] as string)) {
+            return errorResult(
+              `Data '${String(a[k])}' niepoprawna - wymagany format ISO YYYY-MM-DD z realna data kalendarzowa (np. '2015-01-01').`,
+              "invalid_date"
+            );
+          }
+        }
+        if (
+          typeof a.dateFrom === "string" &&
+          typeof a.dateTo === "string" &&
+          (a.dateFrom as string) > (a.dateTo as string)
+        ) {
+          return errorResult(
+            `dateFrom '${a.dateFrom}' pozniejsze niz dateTo '${a.dateTo}'.`,
+            "invalid_date"
+          );
+        }
+        const pageSize = Math.min(
+          100,
+          Math.max(PAGE_SIZE_MIN, typeof a.pageSize === "number" ? a.pageSize : PAGE_SIZE_DEFAULT)
+        );
+        const pageNumber = Math.max(0, Math.floor(typeof a.pageNumber === "number" ? a.pageNumber : 0));
+        let raw: unknown;
+        let source: Source;
+        try {
+          ({ data: raw, source } = await searchJudgments({
+            all: a.all as string | undefined,
+            caseNumber: a.caseNumber as string | undefined,
+            courtType: a.courtType as string | undefined,
+            judgeName: a.judgeName as string | undefined,
+            referencedRegulation: a.referencedRegulation as string | undefined,
+            legalBase: a.legalBase as string | undefined,
+            judgmentDateFrom: a.dateFrom as string | undefined,
+            judgmentDateTo: a.dateTo as string | undefined,
+            pageSize: a.pageSize as number | undefined,
+            pageNumber: a.pageNumber as number | undefined,
+          }, "search"));
+        } catch (err) {
+          return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
+        }
+        const { text, pagination } = formatSearchResults(raw, pageNumber, pageSize);
+        // F-08: out-of-range page keeps totalResults visible (structured too).
+        if ((raw as SearchResponse).items?.length === 0 && (pagination.totalResults ?? 0) > 0) {
+          return {
+            content: [{ type: "text", text: withSourceNote(`[page_out_of_range] ${text}`, source) }],
+            structuredContent: {
+              citations: buildSearchCitations(raw),
+              source,
+              pagination,
+              error_code: "page_out_of_range",
+            },
+          };
+        }
         return {
-          content: [{ type: "text", text: withSourceNote(formatSearchResults(raw), source) }],
-          structuredContent: { citations: buildSearchCitations(raw), source },
+          content: [{ type: "text", text: withSourceNote(text, source) }],
+          structuredContent: { citations: buildSearchCitations(raw), source, pagination },
         };
       }
 
       case "get_judgment": {
-        if (!a.id) {
-          return errorResult("parametr 'id' jest wymagany.", "missing_arg");
+        // F-09: 0/""/missing = missing_arg; "abc"/-5/1.5 = invalid_arg (caller).
+        const parsed = parseIdArg(a.id);
+        if (!parsed.ok) {
+          return parsed.empty
+            ? errorResult("parametr 'id' jest wymagany.", "missing_arg")
+            : errorResult(
+                `parametr 'id' musi byc dodatnia liczba calkowita (otrzymano '${String(a.id)}').`,
+                "invalid_arg"
+              );
         }
-        const { data: raw, source } = await getJudgment(a.id as string | number, "get_judgment");
+        const offset = Math.max(0, Math.floor(parseChunkArg(a.offset, 0)));
+        const limit = Math.min(
+          JUDGMENT_CHUNK_MAX,
+          Math.max(1, Math.floor(parseChunkArg(a.limit, JUDGMENT_CHUNK_DEFAULT)))
+        );
+        let raw: unknown;
+        let source: Source;
+        try {
+          ({ data: raw, source } = await getJudgment(parsed.id, "get_judgment"));
+        } catch (err) {
+          if (err instanceof HttpError && err.status === 404) {
+            return errorResult(
+              `Orzeczenie ID ${parsed.id} nie znalezione w SAOS. Sprawdz ID przez 'search' / 'search_by_case' lub czy nie jest to sad administracyjny (WSA/NSA - uzyj mcp-nsa).`,
+              "not_found",
+              { fault: "upstream", retryable: false, status: 404 }
+            );
+          }
+          return upstreamErrorResult(
+            err,
+            "Sprawdz polaczenie lub sprobuj ponownie."
+          );
+        }
         if (!raw || (typeof raw === "object" && Object.keys(raw).length === 0)) {
           return errorResult(
-            `Orzeczenie ID ${a.id} nie znalezione w SAOS. Sprawdz ID przez 'search' / 'search_by_case' lub czy nie jest to sad administracyjny (WSA/NSA - uzyj mcp-nsa).`,
+            `Orzeczenie ID ${parsed.id} nie znalezione w SAOS. Sprawdz ID przez 'search' / 'search_by_case' lub czy nie jest to sad administracyjny (WSA/NSA - uzyj mcp-nsa).`,
             "not_found"
           );
         }
         const citation = buildJudgmentCitation(raw);
+        const chunk = formatJudgment(raw, offset, limit);
         return {
-          content: [{ type: "text", text: withSourceNote(formatJudgment(raw), source) }],
-          structuredContent: { citations: citation ? [citation] : [], source },
+          content: [{ type: "text", text: withSourceNote(chunk.text, source) }],
+          structuredContent: {
+            citations: citation ? [citation] : [],
+            source,
+            totalLength: chunk.totalLength,
+            returnedLength: chunk.returnedLength,
+            offset: chunk.offset,
+            hasMore: chunk.hasMore,
+            nextOffset: chunk.nextOffset,
+            truncated: chunk.truncated,
+          },
         };
       }
 
@@ -854,13 +1177,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!a.caseNumber) {
           return errorResult("parametr 'caseNumber' jest wymagany.", "missing_arg");
         }
-        const { data: raw, source } = await searchJudgments({
-          caseNumber: a.caseNumber as string,
-          pageSize: PAGE_SIZE_DEFAULT,
-        }, "search_by_case");
+        let raw: unknown;
+        let source: Source;
+        try {
+          ({ data: raw, source } = await searchJudgments({
+            caseNumber: a.caseNumber as string,
+            pageSize: PAGE_SIZE_DEFAULT,
+          }, "search_by_case"));
+        } catch (err) {
+          return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
+        }
+        const { text, pagination } = formatSearchResults(raw, 0, PAGE_SIZE_DEFAULT);
         return {
-          content: [{ type: "text", text: withSourceNote(formatSearchResults(raw), source) }],
-          structuredContent: { citations: buildSearchCitations(raw), source },
+          content: [{ type: "text", text: withSourceNote(text, source) }],
+          structuredContent: { citations: buildSearchCitations(raw), source, pagination },
         };
       }
 
@@ -868,18 +1198,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!a.caseNumber) {
           return errorResult("parametr 'caseNumber' jest wymagany.", "missing_arg");
         }
-        return await runCiteCheck(a);
+        try {
+          return await runCiteCheck(a);
+        } catch (err) {
+          return upstreamErrorResult(err, "Citator wymaga dostepu do SAOS.");
+        }
       }
 
       default:
         return errorResult(`Nieznane narzedzie: ${name}`, "missing_arg");
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return errorResult(
-      `Blad komunikacji z API SAOS: ${msg}. Sprawdz polaczenie lub sprobuj ponownie.`,
-      "upstream_error"
-    );
+    return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
   }
 });
 
@@ -969,8 +1299,38 @@ async function startHttp(): Promise<void> {
       return;
     }
     if (path === "/status") {
+      // F-04: optional bearer gate. If STATUS_TOKEN is set, the endpoint
+      // requires `Authorization: Bearer <token>`; otherwise it serves the
+      // REDACTED diagnostics only (store.stats() carries hashes, not queries).
+      const token = process.env.STATUS_TOKEN;
+      if (token) {
+        const auth = req.headers.authorization ?? "";
+        const qsToken = new URL(req.url ?? "/", "http://x").searchParams.get("token");
+        if (auth !== `Bearer ${token}` && qsToken !== token) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+      }
       const store = localStore();
-      sendJson(res, 200, store ? { ...store.stats(), sync_running: syncRunning } : { local: false, sync_running: syncRunning });
+      const base = {
+        service: "mcp-saos",
+        buildVersion: BUILD_VERSION,
+        gitCommit: GIT_COMMIT,
+        dataSource: "local_dump+saos_api",
+        sync_running: syncRunning,
+      };
+      sendJson(
+        res,
+        200,
+        store
+          ? {
+              ...base,
+              ...store.stats(),
+              lastSync: store.getState("last_sync"),
+              indexStatus: store.mirrorIntegrity(),
+            }
+          : { ...base, local: false }
+      );
       return;
     }
     if (path !== mcpPath) {
@@ -1018,7 +1378,12 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal error: ${err}\n`);
-  process.exit(1);
-});
+// Import-safe: unit tests import pure helpers (formatJudgment,
+// parseIdArg, citeCoverage) from the built module. The server listens on
+// stdio only when executed directly (node dist/index.js), never on import.
+if (typeof require !== "undefined" && require.main === module) {
+  main().catch((err) => {
+    process.stderr.write(`Fatal error: ${err}\n`);
+    process.exit(1);
+  });
+}

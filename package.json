@@ -1,6 +1,6 @@
 {
   "name": "@matematicsolutions/mcp-saos",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "MCP server - Polish court judgments from a local mirror of the SAOS dump (System Analizy Orzeczen Sadowych), SAOS API as fallback",
   "main": "dist/index.js",
   "scripts": {
@@ -10,7 +10,7 @@
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "drift": "node test/drift.mjs",
-    "test:unit": "node --test test/cite-check.test.mjs",
+    "test:unit": "node --test test/cite-check.test.mjs test/acceptance.test.mjs",
     "test": "npm run drift && npm run test:unit",
     "sync": "node dist/sync.js"
   },
@@ -37,7 +37,7 @@
   "mcpName": "io.github.matematicsolutions/mcp-saos",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/matematicsolutions/mcp-saos.git"
+    "url": "git+https://github.com/elconcept/mcp-saos.git"
   },
   "bin": {
     "mcp-saos": "dist/index.js"

@@ -101,23 +101,39 @@ async function runWindow(store: Store, start: string, end: string, retried = fal
   const row = store.db.prepare("SELECT next_page, fetched FROM windows WHERE start = ?").get(start) as { next_page: number; fetched: number };
   let fetched = row.fetched;
   const save = store.db.prepare("UPDATE windows SET next_page = ?, fetched = ? WHERE start = ?");
-  for await (const { page, items } of pages<DumpJudgment>("/dump/judgments", { judgmentStartDate: start, judgmentEndDate: end }, row.next_page)) {
-    if (items.length) store.upsertMany(items);
-    fetched += items.length;
-    save.run(page + 1, fetched, start);
+  const mark = store.db.prepare(
+    "UPDATE windows SET expected = ?, completed_at = ?, status = ?, shortfall = ?, checked_at = ? WHERE start = ?"
+  );
+  const now = () => new Date().toISOString();
+  try {
+    for await (const { page, items } of pages<DumpJudgment>("/dump/judgments", { judgmentStartDate: start, judgmentEndDate: end }, row.next_page)) {
+      if (items.length) store.upsertMany(items);
+      fetched += items.length;
+      save.run(page + 1, fetched, start);
+    }
+  } catch (err) {
+    // F-03: a failed window is FAILED, never silent success - scheduler retries it.
+    try {
+      store.db.prepare("UPDATE windows SET status = ?, checked_at = ? WHERE start = ?").run("failed", now(), start);
+    } catch { /* pre-migration mirror */ }
+    throw err;
   }
   const expected = await upstreamCount(start, end);
   const local = localCount(store, start, end);
+  const shortfall = expected - local;
+  const tolerance = Math.max(10, expected * 0.005);
   // The search index keeps stale dates for a few judgments (they sit in a
   // neighbouring window locally), so a shortfall of a handful is expected;
   // only a real gap (lost pages) triggers a second download.
-  if (local < expected - Math.max(10, expected * 0.005) && !retried) {
+  if (shortfall > tolerance && !retried) {
     log(`window ${start}..${end}: local ${local} < upstream ${expected}, downloading again`);
     save.run(0, 0, start);
     return runWindow(store, start, end, true);
   }
-  store.db.prepare("UPDATE windows SET expected = ?, completed_at = ? WHERE start = ?").run(expected, new Date().toISOString(), start);
-  log(`window ${start}..${end}: ${fetched} fetched, local ${local}, upstream ${expected}${local < expected ? " (SHORT)" : ""}`);
+  // F-03: significant post-retry shortfall = DEGRADED, not success.
+  const status = shortfall > tolerance ? "degraded" : "verified";
+  mark.run(expected, now(), status, shortfall, now(), start);
+  log(`window ${start}..${end}: ${fetched} fetched, local ${local}, upstream ${expected} [${status}]${status === "degraded" ? " (SHORT - needs review)" : ""}`);
 }
 
 async function fullSync(store: Store, restart: boolean): Promise<void> {
@@ -190,4 +206,6 @@ async function main() {
   }
 }
 
-main();
+if (typeof require !== "undefined" && require.main === module) {
+  main();
+}

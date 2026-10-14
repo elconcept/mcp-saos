@@ -1,9 +1,9 @@
 {
-  "package_version": "1.2.0",
-  "toolset_sha256": "891a516da9e89d3ffb1f655ee7f7796fb55441f246a060e222f78eb10b48b1bd",
+  "package_version": "1.4.0",
+  "toolset_sha256": "f91045b98b6ed2e26d8606b58f2097d4219d7d0d757a0c468ed9200a1de8bc5d",
   "tools": {
     "get_judgment": {
-      "sha256": "5cd47f36923d2462990bcd6bace3f0967595fb3b10a2dcae8c48e9f7b035ba68",
+      "sha256": "eb8852ed025d90624d28eebb037c4a628bfa1b6360574da1bdd73df31705ea50",
       "descriptor": {
         "annotations": {
           "destructiveHint": false,
@@ -11,7 +11,7 @@
           "openWorldHint": true,
           "readOnlyHint": true
         },
-        "description": "Pobiera pelne orzeczenie z SAOS po jego numerycznym ID. Zwraca metadane (sygnatura, sad, data, sklad, podstawy prawne), streszczenie (jesli dostepne) oraz pierwsze 2000 znakow tresci. ID orzeczenia pochodzi z wynikow narzedzia 'search' lub 'search_by_case'. Bledy: `missing_arg` (brak id), `not_found` (id poza baza), `upstream_error`.",
+        "description": "Pobiera orzeczenie z SAOS po jego numerycznym ID. Zwraca metadane (sygnatura, sad, data, sklad, podstawy prawne), streszczenie (jesli dostepne) oraz fragment tresci (domyslnie pierwsze 2000 znakow; offset/limit do max 20000 skladaja caly tekst). ID orzeczenia pochodzi z wynikow narzedzia 'search' lub 'search_by_case'. Bledy: `missing_arg` (brak id), `invalid_arg` (id nie-numeryczne/<=0, tez upstream 400), `not_found` (id poza baza, tez upstream 404), `upstream_error`.",
         "inputSchema": {
           "properties": {
             "id": {
@@ -20,6 +20,17 @@
                 "string",
                 "number"
               ]
+            },
+            "limit": {
+              "description": "Dlugosc fragmentu w znakach (1-20000). Domyslnie 2000 (kompatybilnosc wstecz).",
+              "maximum": 20000,
+              "minimum": 1,
+              "type": "number"
+            },
+            "offset": {
+              "description": "Poczatek fragmentu tresci w znakach (od 0). Domyslnie 0.",
+              "minimum": 0,
+              "type": "number"
             }
           },
           "required": [
@@ -31,7 +42,7 @@
       }
     },
     "saos_cite_check": {
-      "sha256": "dacf27b2997f06b448b675663bdba23e087dd5466650ec7eb4603e14b3431824",
+      "sha256": "ea3fd3deacabc97faa8b44646bc7d58d0dc99cc81cdc854c68497c351a459322",
       "descriptor": {
         "annotations": {
           "destructiveHint": false,
@@ -39,7 +50,7 @@
           "openWorldHint": true,
           "readOnlyHint": true
         },
-        "description": "Citator 'czy wyrok zyje': dla podanej sygnatury szuka POZNIEJSZYCH orzeczen, ktore ja cytuja (pelnotekstowo w SAOS), i skanuje ich uzasadnienia pod frazy przelamania linii orzeczniczej (np. 'odstepuje od pogladu wyrazonego', 'nie podziela pogladu', 'traci moc uchwala', 'uchwala skladu siedmiu sedziow') w oknie ~500 znakow wokol wystapienia sygnatury. Werdykt: przelamanie_wykryte / uchwala_skladu_powiekszonego / nadal_cytowany / brak_cytowan_w_saos. To heurystyka - kazde trafienie ma fragment tekstu do recznej weryfikacji, a brak trafien NIE potwierdza aktualnosci orzeczenia. Bledy: `missing_arg` (nieczytelna sygnatura), `invalid_court_type`, `upstream_error`.",
+        "description": "Citator 'czy wyrok zyje': dla podanej sygnatury szuka POZNIEJSZYCH orzeczen, ktore ja cytuja (pelnotekstowo w SAOS), i skanuje ich uzasadnienia pod frazy przelamania linii orzeczniczej (np. 'odstepuje od pogladu wyrazonego', 'nie podziela pogladu', 'traci moc uchwala', 'uchwala skladu siedmiu sedziow') w oknie ~500 znakow wokol wystapienia sygnatury. Werdykt: przelamanie_wykryte / uchwala_skladu_powiekszonego / nadal_cytowany / brak_cytowan_w_saos + status pokrycia complete/partial. To heurystyka - kazde trafienie ma fragment tekstu do recznej weryfikacji, a brak trafien NIE potwierdza aktualnosci orzeczenia. Bledy: `missing_arg` (nieczytelna sygnatura), `invalid_court_type`, `upstream_error`.",
         "inputSchema": {
           "properties": {
             "caseNumber": {
@@ -65,6 +76,11 @@
               "maximum": 20,
               "minimum": 1,
               "type": "number"
+            },
+            "pageNumber": {
+              "description": "Strona listy orzeczen cytujacych (100/strona, od 0). Do przegladania cytowan poza pierwsza setka.",
+              "minimum": 0,
+              "type": "number"
             }
           },
           "required": [
@@ -76,7 +92,7 @@
       }
     },
     "search": {
-      "sha256": "4489dd6920b5e07347894980550768407a196c7950502ee4cdd1d5bcf19fcad0",
+      "sha256": "9f0eaa69dee6486f3f790671050d5c4d2f3ddb4d4db396ef1510827762763d56",
       "descriptor": {
         "annotations": {
           "destructiveHint": false,
@@ -84,7 +100,7 @@
           "openWorldHint": true,
           "readOnlyHint": true
         },
-        "description": "Przeszukuje baze orzeczen sadow polskich w SAOS (System Analizy Orzeczen Sadowych). Pokrycie obejmuje takze orzeczenia biezace (lata 2024-2026 sa dobrze reprezentowane), ale jest nierowne wg typu sadu. Sady administracyjne (WSA/NSA) NIE sa indeksowane. Daty bywaja znieksztalcone przez OCR - weryfikuj sygnature i date w zrodle. Przydatny do: analizy linii orzeczniczej, precedensow, wyszukiwania po tresci / sygnatuze / sedzim / podstawie prawnej. Bledy: `invalid_court_type` (zly enum), `upstream_error` (HTTP/timeout API).",
+        "description": "Przeszukuje baze orzeczen sadow polskich w SAOS (System Analizy Orzeczen Sadowych). Pokrycie obejmuje takze orzeczenia biezace (lata 2024-2026 sa dobrze reprezentowane), ale jest nierowne wg typu sadu. Sady administracyjne (WSA/NSA) NIE sa indeksowane. Daty bywaja znieksztalcone przez OCR - weryfikuj sygnature i date w zrodle. Przydatny do: analizy linii orzeczniczej, precedensow, wyszukiwania po tresci / sygnatuze / sedzim / podstawie prawnej. Bledy: `invalid_court_type` (zly enum), `invalid_date` (zly format daty), `page_out_of_range` (strona poza zakresem przy totalResults>0), `upstream_error` (HTTP/timeout API).",
         "inputSchema": {
           "properties": {
             "all": {
@@ -118,7 +134,7 @@
               "type": "string"
             },
             "legalBase": {
-              "description": "Podstawa prawna, np. 'art. 415 kc' lub 'art. 6 RODO'.",
+              "description": "Podstawa prawna rozstrzygniecia (indeks legalBases - przepisy wskazane jako podstawa wyroku), np. 'art. 415 kc' lub 'art. 6 RODO'. Wezszy niz referencedRegulation: orzeczenie przywolujace przepis w uzasadnieniu, ale oparte na innej podstawie, NIE musi trafic do wynikow legalBase.",
               "type": "string"
             },
             "pageNumber": {
@@ -133,7 +149,7 @@
               "type": "number"
             },
             "referencedRegulation": {
-              "description": "Przywolany akt prawny, np. 'ustawa o ochronie danych osobowych'.",
+              "description": "Przywolany akt prawny (indeks referencedRegulations), np. 'ustawa o ochronie danych osobowych'. Szerszy niz legalBase - lapie kazde przywolanie aktu w tresci/metadanych.",
               "type": "string"
             }
           },

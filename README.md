@@ -41,8 +41,8 @@ Administrative courts (WSA/NSA) - no data in SAOS.
 
 | Tool | Description |
 |---|---|
-| `search` | Full-text and filtered search (court, judge, legal basis, dates) |
-| `get_judgment` | Full judgment by ID from SAOS |
+| `search` | Full-text and filtered search (court, judge, legal basis, dates) - paginated, with `pagination` in structuredContent |
+| `get_judgment` | Judgment by ID from SAOS - metadata + text in chunks (`offset`/`limit`, default first 2000 chars; `hasMore`/`nextOffset` chain to the full text) |
 | `search_by_case` | Shortcut: search by case number (e.g. "I ACa 772/13") |
 | `saos_cite_check` | Citator: is the judgment still good law? Finds later citing judgments and scans them for overruling language near the signature |
 
@@ -112,7 +112,7 @@ or double backslashes `\\`.
 
 ```bash
 npm run build
-npm test            # offline: drift test + unit tests (parser, window scan, phrase patterns)
+npm test            # offline: drift test + unit tests (parser, window scan, phrase patterns, 11 acceptance scenarios F-01..F-11)
 node test/smoke.mjs # live: 5 checks against the real SAOS API, including the citator
 ```
 
@@ -171,7 +171,28 @@ search API on every request:
   in every tool response.
 - `saos_cite_check` is a heuristic. It reads the top citing judgments only,
   its phrase list cannot cover every way a court departs from a line of case
-  law, and no hits does not confirm the judgment is current.
+  law, and no hits does not confirm the judgment is current. Every response
+  carries explicit coverage (`totalCandidates`, `loadedCandidates`,
+  `scannedFullText`, `unexaminedCandidates`, `status: complete|partial`) -
+  a partial analysis says so and must not be quoted as a final verdict.
+  A phrase describing the EXAMINED judgment itself as an enlarged-panel
+  resolution is not downstream evidence (requires another resolution or a
+  referred legal question). Use `pageNumber` to walk past the first 100
+  citing judgments.
+- `legalBase` searches the judgment's stated legal basis (narrow); use
+  `referencedRegulation` for any citation of an act in the reasoning or
+  metadata (broad). A judgment citing art. 445 k.c. in passing but decided on
+  another basis may match `referencedRegulation` and miss `legalBase` - by design.
+- Invalid dates (`dateFrom`/`dateTo` outside ISO `YYYY-MM-DD` or
+  non-calendrical) fail with `invalid_date` - they are never ignored.
+- An out-of-range page (`items=[]`, `totalResults>0`) returns
+  `page_out_of_range` with the real totals - distinct from zero results.
+- Upstream HTTP 404 surfaces as `not_found`, HTTP 400 as `invalid_arg`
+  (with `fault`/`retryable`/`status` in structuredContent); HTTP 401/403 never
+  trigger exit-IP rotation, HTTP 429 honours `Retry-After`.
+- `GET /status` exposes only redacted diagnostics (query hashes, counters;
+  `buildVersion`, `gitCommit`, `dataSource`, `lastSync`, `indexStatus`).
+  Set `STATUS_TOKEN` to gate it with `Authorization: Bearer <token>`.
 
 ## License
 

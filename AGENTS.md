@@ -15,16 +15,18 @@ The connector plugs in via `mcp-servers.json` in any protocol-compliant client (
 The repo is run by [MateMatic Solutions](https://matematicsolutions.com). The connector is **trust infrastructure** - it serves any LegalTech product that needs citations from Polish case law, in any jurisdiction.
 
 - **Every tool call MUST return `structuredContent.citations`** with: judgment title, canonical URL (SAOS), court, date, case number. This is the product contract.
-- **No caching of client data** - the connector does not log queries. Fork elconcept (1.3.0+): judgments are served from a local mirror of the public SAOS dump (`src/sync.ts`, `src/store.ts`, `src/engine.ts`); only queries whose local answer was empty while the SAOS API had results are recorded (table `discrepancies`) - that is a mirror integrity check, not query logging.
-- **No content modification** - we return exactly what the SAOS API returns, with no "enhancement" / summarization. Modification = loss of evidentiary value.
+- **No caching of client data** - the connector does not log queries. Fork elconcept (1.3.0+): judgments are served from a local mirror of the public SAOS dump (`src/sync.ts`, `src/store.ts`, `src/engine.ts`); only queries whose local answer was empty while the SAOS API had results are recorded (table `discrepancies`) - that is a mirror integrity check, not query logging. Since 1.4.0 the public diagnostics (`GET /status`, stderr) carry only SHA-256 hashes and counters, never raw query text or upstream ids.
+- **No content modification** - we return exactly what the SAOS API returns, with no "enhancement" / summarization. Modification = loss of evidentiary value. (`get_judgment` slices the verbatim text into `offset`/`limit` chunks - slicing positions, never wording.)
+- **Citator honesty (1.4.0+)** - `saos_cite_check` reports `status: complete|partial` with unexamined counts; a self-description of the examined judgment as an enlarged-panel resolution is dropped, not verdict evidence; every hit carries `attitude` (mentioned/followed/distinguished/criticized/potentially_overruled/unknown).
 
 ## MCP tools (tools contract)
 
-| Tool | Key parameters | Returns |
+| Tool | Key parameters (camelCase, as in inputSchema) | Returns |
 |---|---|---|
-| `search` | `query`, `court_type?`, `date_from?`, `date_to?` | list of judgments with metadata + citations |
-| `get_judgment` | `judgment_id` | full judgment text + metadata + citations |
-| `search_by_case` | `case_number` (case signature) | all judgments for a given case number |
+| `search` | `all?`, `caseNumber?`, `courtType?`, `judgeName?`, `referencedRegulation?`, `legalBase?`, `dateFrom?`, `dateTo?`, `pageSize?`, `pageNumber?` | list of judgments with metadata + citations + pagination |
+| `get_judgment` | `id` (required), `offset?`, `limit?` (max 20000, default 2000) | metadata + text chunk + chunk descriptors (`totalLength`, `hasMore`, `nextOffset`) + citations |
+| `search_by_case` | `caseNumber` (required) | all judgments for a given case number |
+| `saos_cite_check` | `caseNumber` (required), `courtType?`, `maxScan?`, `deepScan?`, `pageNumber?` | verdict + coverage (`totalCandidates`/`unexaminedCandidates`/`status`) + hits with attitude + citations |
 
 Full schema description: `src/index.ts` + MCP documentation in `README.md`.
 
@@ -83,4 +85,6 @@ Citation: *MateMatic Solutions (2026), mcp-saos - MCP server for Polish SAOS cas
 `/volume2/docker/mcp-saos` = this repo. Portainer stack `mcp-saos` built from `docker-compose.yaml`; network
 `cf_mcp_saos` (cloudflared + this container), no host ports, public only as https://mcp-saos.xlap.pl/mcp behind
 Cloudflare Access (Managed OAuth). Data: `./data/saos.sqlite` (git-ignored). Push to `main` -> GitHub Actions ->
-deploy-hook rebuilds the stack. Mirror state: `GET /status`.
+deploy-hook rebuilds the stack. Mirror state: `GET /status` (redacted since
+1.4.0: hashes/counters + `buildVersion`, `gitCommit`, `dataSource`,
+`lastSync`, `indexStatus`; gate with `STATUS_TOKEN` -> `Authorization: Bearer`).

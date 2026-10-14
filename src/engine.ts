@@ -14,7 +14,7 @@
 
 import { existsSync } from "node:fs";
 import { fetchJson, SAOS_BASE } from "./http.js";
-import { Store, dateRange, defaultDbPath, type DumpJudgment } from "./store.js";
+import { Store, dateRange, defaultDbPath, hashParams, type DumpJudgment } from "./store.js";
 import { buildAllTokens, buildPhrase, buildTextQuery } from "./text.js";
 
 // Minimum pageSize enforced by the SAOS API. Smaller values return HTTP 400.
@@ -161,13 +161,39 @@ export async function searchJudgments(p: SearchParams, tool: string): Promise<En
     if (ids.length > 0) {
       const total = up.info?.totalResults ?? ids.length;
       s.logDiscrepancy(tool, p, total, ids);
-      warn(`DISCREPANCY ${tool}: local 0, SAOS ${total} for ${JSON.stringify(p)}`);
+      // F-04: stderr carries only the params hash, never raw query content.
+      warn(`DISCREPANCY ${tool}: local 0, SAOS ${total} (params_hash=${hashParams(p)})`);
       return { data: up, source: "saos_api_fallback" };
     }
   } catch (err) {
     warn(`cross-check ${tool} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
   return { data: local, source: "local_dump" };
+}
+
+/**
+ * F-02: completeness probe for a non-empty-but-partial mirror. Compares the
+ * local total against the SAOS API total for the same params WITHOUT
+ * returning upstream data (audit only). Returns the gap so callers and tests
+ * can detect a mirror that answers but under-reports.
+ */
+export async function probeMirrorGap(
+  s: Store,
+  p: SearchParams,
+  localTotal: number,
+): Promise<{ upstreamTotal: number | null; gap: number | null; partial: boolean }> {
+  try {
+    const up = (await saosSearch({ ...p, pageSize: 10, pageNumber: 0 })) as {
+      info?: { totalResults?: number };
+    };
+    const upstreamTotal = up.info?.totalResults ?? null;
+    if (upstreamTotal === null) return { upstreamTotal: null, gap: null, partial: false };
+    const gap = upstreamTotal - localTotal;
+    const tolerance = Math.max(10, upstreamTotal * 0.005);
+    return { upstreamTotal, gap, partial: gap > tolerance };
+  } catch {
+    return { upstreamTotal: null, gap: null, partial: false };
+  }
 }
 
 export async function getJudgment(id: string | number, tool: string): Promise<EngineResult> {
