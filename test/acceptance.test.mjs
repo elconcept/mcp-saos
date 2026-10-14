@@ -20,7 +20,13 @@ import {
   formatSearchResults,
   parseIdArg,
   citeCoverage,
+  citingPageError,
+  applyUnknownTargetRule,
+  buildStatusPayload,
+  isStatusAuthorized,
 } from "../dist/index.js";
+import { gapAssessment } from "../dist/engine.js";
+import { completionGate } from "../dist/sync.js";
 import { isValidIsoDate, Store, hashParams } from "../dist/store.js";
 import {
   classifyHttpError,
@@ -29,6 +35,7 @@ import {
 import {
   isSelfDescription,
   attitudeForLabel,
+  computeVerdict,
 } from "../dist/cite-check.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -197,8 +204,90 @@ test("AC7: partial coverage is explicit (5388 total, 100 loaded, 3 scanned)", ()
   assert.equal(c.unexaminedCandidates, 5288);
   assert.equal(c.analysisComplete, false);
   assert.equal(c.status, "partial");
+  assert.equal(c.analysisMode, "sampled_full_text");
   const full = citeCoverage(12, 12, 2, 12, 8, false);
   assert.equal(full.unexaminedCandidates, 0);
+});
+
+// ---------------------------------------------------------------------------
+// CIT-01: snippets-only is a preliminary review, never a complete analysis
+// (memo: IV CSK 792/14, deepScan=false, scannedFullText=0 -> was complete)
+// ---------------------------------------------------------------------------
+
+test("CIT-01: 13/13 candidates with 0 full texts is partial + snippets_only", () => {
+  const c = citeCoverage(13, 13, 0, 13, 8, false);
+  assert.equal(c.unexaminedCandidates, 0);
+  assert.equal(c.candidateCoverage, 1);
+  assert.equal(c.fullTextCoverage, 0);
+  assert.equal(c.analysisMode, "snippets_only");
+  assert.equal(c.analysisComplete, false);
+  assert.equal(c.status, "partial");
+});
+
+test("CIT-01b: deepScan capped by maxScan stays sampled + partial", () => {
+  const c = citeCoverage(13, 13, 5, 13, 5, true);
+  assert.equal(c.analysisMode, "sampled_full_text");
+  assert.equal(c.fullTextCoverage, 5 / 13);
+  assert.equal(c.analysisComplete, false);
+  assert.equal(c.status, "partial");
+});
+
+test("CIT-01c: exhaustive full-text scan completes", () => {
+  const c = citeCoverage(13, 13, 13, 13, 20, true);
+  assert.equal(c.analysisMode, "exhaustive_full_text");
+  assert.equal(c.fullTextCoverage, 1);
+  assert.equal(c.analysisComplete, true);
+  assert.equal(c.status, "complete");
+});
+
+test("CIT-01d: zero citing needs no full texts (vacuous completion)", () => {
+  const c = citeCoverage(0, 0, 0, 0, 8, false);
+  assert.equal(c.candidateCoverage, 1);
+  assert.equal(c.fullTextCoverage, 1);
+  assert.equal(c.analysisComplete, true);
+});
+
+// ---------------------------------------------------------------------------
+// CIT-02: empty citing page with positive total = page_out_of_range
+// (memo: IV CSK 792/14, pageNumber=100 -> was brak_cytowan_w_saos)
+// ---------------------------------------------------------------------------
+
+test("CIT-02: empty page with total>0 is page_out_of_range, never a verdict", () => {
+  const err = citingPageError(13, 0, 100, 100);
+  assert.ok(err);
+  assert.match(err, /pageNumber=100/);
+  assert.match(err, /0\.\.0/);
+  assert.match(err, /13/);
+  assert.equal(citingPageError(13, 13, 0, 100), null);
+  assert.equal(citingPageError(13, 10, 0, 100), null);
+  assert.equal(citingPageError(0, 0, 0, 100), null);
+  assert.equal(citingPageError(0, 0, 5, 100), null);
+});
+
+// ---------------------------------------------------------------------------
+// CIT-03: caution alone never escalates (memo: III CZP 6/21 self-description)
+// ---------------------------------------------------------------------------
+
+test("CIT-03: caution-only verdict is neutral, strong still wins", () => {
+  assert.equal(computeVerdict(5388, [{ severity: "caution" }]), "nieustalone");
+  assert.equal(
+    computeVerdict(5, [{ severity: "caution" }, { severity: "strong" }]),
+    "przelamanie_wykryte"
+  );
+  assert.equal(computeVerdict(3, []), "nadal_cytowany");
+  assert.equal(computeVerdict(0, []), "brak_cytowan_w_saos");
+});
+
+// ---------------------------------------------------------------------------
+// CIT-04: unknown target + zero hits is nieustalone (memo: XX CSK 999999/99)
+// ---------------------------------------------------------------------------
+
+test("CIT-04: unverified signature with no hits is nieustalone", () => {
+  assert.equal(applyUnknownTargetRule("brak_cytowan_w_saos", false, 0), "nieustalone");
+  assert.equal(applyUnknownTargetRule("nieustalone", false, 0), "nieustalone");
+  assert.equal(applyUnknownTargetRule("nadal_cytowany", false, 5), "nadal_cytowany");
+  assert.equal(applyUnknownTargetRule("przelamanie_wykryte", false, 5), "przelamanie_wykryte");
+  assert.equal(applyUnknownTargetRule("brak_cytowan_w_saos", true, 0), "brak_cytowan_w_saos");
 });
 
 // ---------------------------------------------------------------------------
@@ -240,6 +329,102 @@ test("AC8/AC9: degraded windows make the mirror partial, never complete", { skip
 });
 
 // ---------------------------------------------------------------------------
+// F-02: local 2 vs upstream 5 is a flagged gap, not "only 2 exist"
+// ---------------------------------------------------------------------------
+
+test("F-02: gap arithmetic flags under-reporting beyond tolerance", () => {
+  const memo = gapAssessment(2, 5);
+  assert.equal(memo.gap, 3);
+  assert.equal(memo.partial, true);
+  assert.equal(gapAssessment(100, 100).partial, false);
+  assert.equal(gapAssessment(1000, 1005).partial, false);
+  assert.equal(gapAssessment(1000, 1100).partial, true);
+  // Local ahead of upstream (incremental corrections) is not a gap.
+  assert.equal(gapAssessment(543536, 543276).partial, false);
+  // Unreachable upstream carries no verdict about completeness.
+  assert.deepEqual(gapAssessment(7, null), { gap: null, partial: false });
+});
+
+test("F-02b: partial-mirror answers carry a visible gap warning", () => {
+  const raw = {
+    items: [
+      { id: 1, courtCases: [{ caseNumber: "X 1/20" }], judgmentDate: "2020-01-01" },
+      { id: 2, courtCases: [{ caseNumber: "X 2/20" }], judgmentDate: "2020-01-02" },
+    ],
+    info: { totalResults: 2 },
+    links: [{ rel: "self", href: "local" }],
+    mirror_gap: {
+      local_total: 2, upstream_total: 5, gap: 3,
+      integrity: "partial", detail: "2 degraded of 334 windows",
+    },
+  };
+  const { text } = formatSearchResults(raw, 0, 10);
+  assert.match(text, /niepelna/);
+  assert.match(text, /w SAOS 5/);
+});
+
+test("F-02c: uncertain mirror (upstream down) warns instead of asserting", () => {
+  const raw = {
+    items: [{ id: 1, courtCases: [{ caseNumber: "X 1/20" }], judgmentDate: "2020-01-01" }],
+    info: { totalResults: 1 },
+    links: [{ rel: "self", href: "local" }],
+    mirror_uncertain: true,
+    mirror_integrity: "partial",
+    mirror_detail: "3 degraded of 334 windows",
+  };
+  const { text } = formatSearchResults(raw, 0, 10);
+  assert.match(text, /niepewna/);
+});
+
+// ---------------------------------------------------------------------------
+// F-03: legacy windows block false completeness; degraded ranges listed
+// ---------------------------------------------------------------------------
+
+test("F-03b: legacy (pre-status) windows read as partial until re-verified", { skip: !hasSqlite && "node:sqlite unavailable" }, () => {
+  const s = tempStore();
+  try {
+    s.setState("initial_complete", "1");
+    s.setState("last_sync", new Date().toISOString());
+    s.db.prepare("INSERT INTO windows(start, end, status, completed_at) VALUES(?, ?, ?, ?)").run(
+      "2020-01-01", "2020-01-31", "retry_pending", new Date().toISOString()
+    );
+    const integ = s.mirrorIntegrity();
+    assert.equal(integ.status, "partial");
+    assert.match(integ.detail, /legacy/);
+    // After an honest recheck promotes the window, the mirror reads complete.
+    s.db.prepare("UPDATE windows SET status = 'verified', checked_at = ? WHERE start = ?").run(
+      new Date().toISOString(), "2020-01-01"
+    );
+    assert.equal(s.mirrorIntegrity().status, "complete");
+  } finally {
+    s.close();
+  }
+});
+
+test("F-03c: degraded window ranges are listed for the repair queue", { skip: !hasSqlite && "node:sqlite unavailable" }, () => {
+  const s = tempStore();
+  try {
+    s.db.prepare("INSERT INTO windows(start, end, status, completed_at) VALUES(?, ?, ?, ?)").run(
+      "2020-02-01", "2020-02-29", "degraded", new Date().toISOString()
+    );
+    const st = s.stats();
+    assert.equal(st.windows_degraded, 1);
+    assert.ok(Array.isArray(st.degraded_windows));
+    assert.ok(st.degraded_windows.includes("2020-02-01..2020-02-29"));
+  } finally {
+    s.close();
+  }
+});
+
+test("F-03d: completion gate blocks false initial_complete", () => {
+  assert.deepEqual(completionGate(0, 0, 0, 0), { complete: true, reason: "all windows verified" });
+  assert.equal(completionGate(0, 0, 1, 0).complete, false);
+  assert.equal(completionGate(0, 0, 0, 334).complete, false);
+  assert.equal(completionGate(1, 0, 0, 0).complete, false);
+  assert.equal(completionGate(0, 2, 0, 0).complete, false);
+});
+
+// ---------------------------------------------------------------------------
 // 10. Public diagnostics carry no raw queries or PII (F-04)
 // ---------------------------------------------------------------------------
 
@@ -260,6 +445,79 @@ test("AC10: stats() redacts discrepancy params to hashes", { skip: !hasSqlite &&
   } finally {
     s.close();
   }
+});
+
+test("F-04b: unauthenticated /status carries counts, never per-query detail", () => {
+  const stats = {
+    judgments: 5,
+    windows_total: 2,
+    index_status: "complete",
+    discrepancies: 1,
+    recent_discrepancies: [
+      { at: "t", tool: "search", params_hash: "abc", upstream_total: 1, upstream_ids_count: 1 },
+    ],
+  };
+  const pub = buildStatusPayload({ service: "mcp-saos" }, stats, false, false);
+  assert.equal(pub.judgments, 5);
+  assert.ok(!("recent_discrepancies" in pub), "per-query detail needs auth");
+  assert.match(String(pub.diagnostics), /STATUS_TOKEN/);
+  const full = buildStatusPayload({ service: "mcp-saos" }, stats, true, true);
+  assert.ok("recent_discrepancies" in full);
+  assert.deepEqual(buildStatusPayload({ service: "x" }, null, false, false), { service: "x", local: false });
+});
+
+test("F-04c: only the Authorization header authenticates - never the URL", () => {
+  assert.equal(isStatusAuthorized({ authorization: "Bearer s3cr3t" }, "s3cr3t"), true);
+  assert.equal(isStatusAuthorized({}, "s3cr3t"), false);
+  assert.equal(isStatusAuthorized({ authorization: "Bearer wrong" }, "s3cr3t"), false);
+  assert.equal(isStatusAuthorized({ authorization: "Bearer s3cr3t" }, undefined), false);
+  assert.equal(isStatusAuthorized({ authorization: ["Bearer s3cr3t"] }, "s3cr3t"), true);
+});
+
+// ---------------------------------------------------------------------------
+// F-10: legalBase vs referencedRegulation index DIFFERENT dump metadata.
+// Memo observation (1 vs 0 hits) is expected field separation, not a bug:
+// legalBase searches the judgment's stated legal bases; referencedRegulation
+// searches the acts it cites. A cited act is NOT automatically a basis.
+// ---------------------------------------------------------------------------
+
+test("F-10: legal and regs fields index separate metadata (controlled)", { skip: !hasSqlite && "node:sqlite unavailable" }, () => {
+  const s = tempStore();
+  try {
+    s.upsertMany([
+      {
+        id: 900001,
+        courtType: "SUPREME",
+        courtCases: [{ caseNumber: "TEST 1/26" }],
+        judgmentDate: "2026-01-15",
+        legalBases: ["artzzq 445 kodeksu"],
+        referencedRegulations: [{ text: "ustawazzr o ochronie" }],
+        textContent: "neutralny tekst kontrolny",
+      },
+    ]);
+    const range = [0, 99999999 * 10000000 + 9999999];
+    const legalHit = s.searchFts("legal : artzzq", range, 10, 0, false);
+    assert.equal(legalHit.total, 1);
+    const regsMiss = s.searchFts("regs : artzzq", range, 10, 0, false);
+    assert.equal(regsMiss.total, 0);
+    const regsHit = s.searchFts("regs : ustawazzr", range, 10, 0, false);
+    assert.equal(regsHit.total, 1);
+    const legalMiss = s.searchFts("legal : ustawazzr", range, 10, 0, false);
+    assert.equal(legalMiss.total, 0);
+  } finally {
+    s.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// F-11: explainer counts are marked as an illustration, never bare numbers
+// ---------------------------------------------------------------------------
+
+test("F-11: search explainer marks example counts as illustration", () => {
+  const { text } = formatSearchResults(fakePage([1, 2], 2), 0, 10);
+  assert.match(text, /Przyklad ilustracyjny/);
+  assert.ok(!text.includes("(6 wynikow dla frazy)"), "bare example counts must not pose as results");
+  assert.ok(!text.includes("(127 wynikow dla tej samej frazy)"));
 });
 
 // ---------------------------------------------------------------------------

@@ -147,6 +147,10 @@ search API on every request:
 - When the local answer is empty the SAOS API is queried as a cross-check. An upstream hit missing locally is
   returned with `structuredContent.source = "saos_api_fallback"`, annotated in the text and recorded in the
   `discrepancies` table (visible at `GET /status`).
+- A NON-empty local answer is trusted only while the mirror reports verified completeness (`indexStatus:
+  complete`). Otherwise the local total is probed against the SAOS API: a gap surfaces as `mirror_gap`
+  (text warning + structured counts + discrepancy row); an unreachable API surfaces as `mirror_uncertain`
+  instead of an authoritative count.
 - Full-text: unquoted words are prefix-matched after removing the Polish inflection ending, `"quoted phrases"` match
   adjacent words (inflected forms too, as in SAOS), `-word` excludes, `OR` alternates. Order: judgment date DESC, as in SAOS.
 
@@ -173,12 +177,20 @@ search API on every request:
   its phrase list cannot cover every way a court departs from a line of case
   law, and no hits does not confirm the judgment is current. Every response
   carries explicit coverage (`totalCandidates`, `loadedCandidates`,
-  `scannedFullText`, `unexaminedCandidates`, `status: complete|partial`) -
-  a partial analysis says so and must not be quoted as a final verdict.
+  `candidateCoverage`, `scannedFullText`, `fullTextCoverage`, `analysisMode`:
+  snippets_only / sampled_full_text / exhaustive_full_text,
+  `unexaminedCandidates`, `analysisComplete`, `status: complete|partial`) -
+  a snippets-only scan (`deepScan=false`) is a PRELIMINARY review and always
+  reports partial while citations remain unscanned; it must not be quoted as
+  a final verdict. Verdicts: `przelamanie_wykryte` / `nadal_cytowany` /
+  `nieustalone` / `brak_cytowan_w_saos` (a lone caution signal yields neutral
+  `nieustalone`, never an automatic enlarged-panel alarm).
   A phrase describing the EXAMINED judgment itself as an enlarged-panel
   resolution is not downstream evidence (requires another resolution or a
-  referred legal question). Use `pageNumber` to walk past the first 100
-  citing judgments.
+  referred legal question). An empty citing page with a positive global total
+  is `page_out_of_range`, not "no citations"; an unfound signature with zero
+  hits is `nieustalone`, not "no citations". Use `pageNumber` to walk past
+  the first 100 citing judgments.
 - `legalBase` searches the judgment's stated legal basis (narrow); use
   `referencedRegulation` for any citation of an act in the reasoning or
   metadata (broad). A judgment citing art. 445 k.c. in passing but decided on
@@ -190,9 +202,31 @@ search API on every request:
 - Upstream HTTP 404 surfaces as `not_found`, HTTP 400 as `invalid_arg`
   (with `fault`/`retryable`/`status` in structuredContent); HTTP 401/403 never
   trigger exit-IP rotation, HTTP 429 honours `Retry-After`.
-- `GET /status` exposes only redacted diagnostics (query hashes, counters;
-  `buildVersion`, `gitCommit`, `dataSource`, `lastSync`, `indexStatus`).
-  Set `STATUS_TOKEN` to gate it with `Authorization: Bearer <token>`.
+- `GET /status` exposes counts only (judgments, window states incl. the
+  `degraded_windows` repair queue, `buildVersion`, `gitCommit`, `dataSource`,
+  `lastSync`, `indexStatus`) - never raw queries or upstream ids (hashes at
+  most). Per-query detail (`recent_discrepancies`) requires
+  `Authorization: Bearer <STATUS_TOKEN>`; tokens in the URL query string are
+  NOT accepted. `/healthz` is the user-data-free probe.
+- Sync windows carry `verified` / `degraded` / `failed` (+ legacy pre-status)
+  states; `initial_complete=1` is set only when every window verifies.
+  `node dist/sync.js --recheck` re-verifies non-verified windows without
+  downloading (run once after upgrading from <=1.4.0); the daily incremental
+  run repairs gap windows automatically.
+
+## Operations (restart, update, migration)
+
+- Restart: stateless container (`restart: unless-stopped`); the mirror is a
+  mounted volume (`/data/saos.sqlite`) so a restart resumes the full download
+  from recorded window progress - no data loss, no re-fetch of done windows.
+- Update: push to `main` triggers the deploy-hook rebuild (Portainer stack);
+  verify post-deploy via `GET /status` (`buildVersion`/`gitCommit` change,
+  `indexStatus`) and `tools/list` against `test/tools.lock.json`
+  (`npm run test:descriptors`).
+- Migration: `store.ts` migrates the mirror schema on open (new window
+  columns); pre-1.5.0 windows keep their rows and are re-verified by
+  `--recheck`/incremental - the database file itself is never wiped by
+  an upgrade (only `sync --full` restarts from scratch deliberately).
 
 ## License
 

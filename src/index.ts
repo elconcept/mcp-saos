@@ -39,6 +39,7 @@ import {
   VERDICT_TEXT,
   CITE_CHECK_DISCLAIMER,
   type ScanHit,
+  type Verdict,
 } from "./cite-check.js";
 import { stripHtml } from "./text.js";
 import {
@@ -58,7 +59,7 @@ import {
 
 export const JUDGMENT_CHUNK_DEFAULT = 2000;
 export const JUDGMENT_CHUNK_MAX = 20000;
-const PKG_VERSION = "1.4.0"; // keep in sync with package.json "version"
+const PKG_VERSION = "1.5.0"; // keep in sync with package.json "version"
 const BUILD_VERSION = process.env.BUILD_VERSION ?? PKG_VERSION;
 const GIT_COMMIT = process.env.GIT_COMMIT ?? "unknown";
 
@@ -85,6 +86,18 @@ interface SearchResponse {
   items?: JudgmentItem[];
   info?: { totalResults?: number };
   links?: Array<{ rel?: string; href?: string }>;
+  /** F-02: set by the engine when the local mirror under-reports vs SAOS. */
+  mirror_gap?: {
+    local_total: number;
+    upstream_total: number;
+    gap: number | null;
+    integrity: string;
+    detail: string;
+  };
+  /** F-02: local answer while upstream is unreachable and mirror unverified. */
+  mirror_uncertain?: boolean;
+  mirror_integrity?: string;
+  mirror_detail?: string;
 }
 
 export function formatSearchResults(
@@ -133,13 +146,31 @@ export function formatSearchResults(
 
   const lines: string[] = [
     `Znalezione: ${total} orzeczen (pokazano ${items.length}, strona ${pageNumber}/${Math.max(1, totalPages)}, rozmiar ${pageSize}).`,
-    "Fraza w cudzyslowie = dokladne sasiadujace slowa (6 wynikow dla frazy); bez cudzyslowu = slowa " +
-      "laczone AND z odmiana (127 wynikow dla tej samej frazy). To nie blad - wybierz skladnie swiadomie.",
+    "Fraza w cudzyslowie = dokladne sasiadujace slowa; bez cudzyslowu = slowa " +
+      "laczone AND z odmiana. Przyklad ilustracyjny (NIE wyniki biezacego zapytania): " +
+      "ta sama fraza dala kiedys 6 wynikow w cudzyslowie i 127 bez niego. Wybierz skladnie swiadomie.",
     "Uwaga: daty bywaja znieksztalcone przez OCR (np. rok 3013) - przy " +
       "sortowaniu wg daty weryfikuj sygnature i date w zrodle. Sady " +
       "administracyjne (WSA/NSA) nie sa w SAOS.",
     "",
   ];
+
+  // F-02: never present a partial mirror count as the whole truth.
+  if (data.mirror_gap) {
+    lines.push(
+      `UWAGA - lokalna kopia niepelna dla tego zapytania: lokalnie ${data.mirror_gap.local_total}, ` +
+        `w SAOS ${data.mirror_gap.upstream_total} (brakuje co najmniej ${data.mirror_gap.gap ?? "?"}). ` +
+        `Stan mirrora: ${data.mirror_gap.integrity} (${data.mirror_gap.detail}). ` +
+        "Wyniki ponizej moga byc niekompletne - rozbieznosc zarejestrowano do weryfikacji."
+    );
+  } else if (data.mirror_uncertain) {
+    lines.push(
+      `UWAGA - nie udalo sie zweryfikowac kompletnosci wzgledem SAOS (API nieosiagalne), ` +
+        `a stan mirrora to '${data.mirror_integrity ?? "?"}' (${data.mirror_detail ?? "brak szczegolow"}). ` +
+        "Traktuj powyzsza liczbe wynikow jako niepewna."
+    );
+  }
+  lines.push("");
 
   for (const it of items) {
     const sig = it.courtCases?.[0]?.caseNumber ?? "brak_sygnatury";
@@ -382,6 +413,57 @@ function withSourceNote(text: string, source: Source): string {
 }
 
 // ---------------------------------------------------------------------------
+// F-04: tiered /status diagnostics (pure, exported for tests).
+// ---------------------------------------------------------------------------
+
+export function isStatusAuthorized(
+  headers: Record<string, string | string[] | undefined>,
+  token: string | undefined,
+): boolean {
+  if (!token) return false;
+  const raw = headers.authorization;
+  const auth = Array.isArray(raw) ? raw[0] : raw;
+  return auth === `Bearer ${token}`;
+}
+
+/** Public subset of store.stats(): counts only, no per-query detail. */
+const PUBLIC_STATUS_KEYS = [
+  "judgments",
+  "divisions",
+  "windows_total",
+  "windows_done",
+  "windows_verified",
+  "windows_degraded",
+  "windows_failed",
+  "windows_legacy",
+  "discrepancies",
+  "initial_complete",
+  "last_sync",
+  "last_sync_result",
+  "upstream_total_at_full_sync",
+  "index_status",
+] as const;
+
+export function buildStatusPayload(
+  base: Record<string, unknown>,
+  stats: Record<string, unknown> | null,
+  authorized: boolean,
+  tokenConfigured: boolean,
+): Record<string, unknown> {
+  if (!stats) return { ...base, local: false };
+  if (authorized) return { ...base, ...stats };
+  const minimal: Record<string, unknown> = {};
+  for (const k of PUBLIC_STATUS_KEYS) minimal[k] = stats[k];
+  return {
+    ...base,
+    ...minimal,
+    diagnostics: tokenConfigured
+      ? "authenticate (Authorization: Bearer) for full diagnostics"
+      : "set STATUS_TOKEN and authenticate for full diagnostics",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Citator - orchestration for saos_cite_check (pure logic in cite-check.ts)
 // ---------------------------------------------------------------------------
 
@@ -416,9 +498,28 @@ function isValidDate(d: string | undefined): d is string {
 }
 
 /**
- * F-05: pure coverage arithmetic for the citator (exported for tests).
+ * CIT-01: coverage model for the citator (exported for tests).
  * total/loaded come from the citing-query page, scanned from deepScan.
+ *
+ * - candidateCoverage: share of SAOS candidates loaded onto the page.
+ * - fullTextCoverage: share of in-scope citing judgments whose FULL text was
+ *   examined (1.0 when there is nothing to examine).
+ * - analysisMode: snippets_only (no full texts read - a preliminary review,
+ *   NEVER a full substantive analysis), sampled_full_text, exhaustive_full_text.
+ * - analysisComplete: true only after every analysis required in the declared
+ *   scope ran - i.e. all candidates loaded AND all in-scope full texts read.
  */
+export type AnalysisMode = "snippets_only" | "sampled_full_text" | "exhaustive_full_text";
+
+export interface CiteCoverage {
+  unexaminedCandidates: number;
+  candidateCoverage: number;
+  fullTextCoverage: number;
+  analysisMode: AnalysisMode;
+  analysisComplete: boolean;
+  status: "complete" | "partial";
+}
+
 export function citeCoverage(
   totalCandidates: number,
   loadedCandidates: number,
@@ -426,11 +527,62 @@ export function citeCoverage(
   citingOnPage: number,
   maxScan: number,
   deepScan: boolean,
-): { unexaminedCandidates: number; analysisComplete: boolean; status: "complete" | "partial" } {
+): CiteCoverage {
+  void maxScan;
   const unexaminedCandidates = Math.max(0, totalCandidates - loadedCandidates);
-  const analysisComplete =
-    unexaminedCandidates === 0 && (!deepScan || citingOnPage <= scannedFullText || citingOnPage <= maxScan);
-  return { unexaminedCandidates, analysisComplete, status: analysisComplete ? "complete" : "partial" };
+  const candidateCoverage = totalCandidates <= 0 ? 1 : Math.min(1, loadedCandidates / totalCandidates);
+  const fullTextCoverage =
+    citingOnPage <= 0 ? 1 : Math.min(1, Math.max(0, scannedFullText) / citingOnPage);
+  const analysisMode: AnalysisMode = !deepScan
+    ? "snippets_only"
+    : fullTextCoverage >= 1
+      ? "exhaustive_full_text"
+      : "sampled_full_text";
+  const analysisComplete = unexaminedCandidates === 0 && fullTextCoverage >= 1;
+  return {
+    unexaminedCandidates,
+    candidateCoverage,
+    fullTextCoverage,
+    analysisMode,
+    analysisComplete,
+    status: analysisComplete ? "complete" : "partial",
+  };
+}
+
+/**
+ * CIT-04: never report "no citations in SAOS" for an unverified signature.
+ * When the examined judgment itself was not found (target=null), an empty
+ * result means the signature string is absent - possibly a typo - not proof
+ * that a real judgment has no later citations.
+ */
+export function applyUnknownTargetRule(
+  verdict: Verdict,
+  targetFound: boolean,
+  totalCiting: number,
+): Verdict {
+  if (!targetFound && totalCiting === 0) return "nieustalone";
+  return verdict;
+}
+
+/**
+ * CIT-02: an empty citing page with a positive global total is a caller
+ * error (wrong pageNumber), never a global "no citations" verdict.
+ */
+export function citingPageError(
+  totalCiting: number,
+  loadedOnPage: number,
+  citePage: number,
+  pageSize: number,
+): string | null {
+  if (loadedOnPage === 0 && totalCiting > 0) {
+    const totalPages = Math.max(1, Math.ceil(totalCiting / pageSize));
+    return (
+      `Strona cytowan poza zakresem: pageNumber=${citePage} (rozmiar strony ${pageSize}), ` +
+      `lacznie kandydatow w SAOS: ${totalCiting} (stron: ${totalPages}). ` +
+      `Ustaw pageNumber 0..${totalPages - 1} - pustej strony nie wolno odczytac jako braku cytowan.`
+    );
+  }
+  return null;
 }
 
 /** Exact-match test: does this item's case number equal the target signature? */
@@ -498,6 +650,14 @@ async function runCiteCheck(a: Record<string, unknown>) {
   const citingRaw = citingRes.data as SearchResponse;
   const totalCitingRaw = citingRaw.info?.totalResults ?? 0;
   const loadedRaw = (citingRaw.items ?? []).length;
+
+  // CIT-02: an empty citing page with a positive global total is a caller
+  // error (pageNumber out of range) - never a global "no citations" verdict.
+  const CITE_PAGE_SIZE = 100;
+  const pageProblem = citingPageError(totalCitingRaw, loadedRaw, citePage, CITE_PAGE_SIZE);
+  if (pageProblem) {
+    return errorResult(pageProblem, "page_out_of_range");
+  }
 
   const citing = (citingRaw.items ?? [])
     .filter((it) => it.id !== undefined)
@@ -586,21 +746,34 @@ async function runCiteCheck(a: Record<string, unknown>) {
   }
 
   // 5. Verdict + output.
-  // F-05: explicit coverage - never present a 1.9% scan as a full analysis.
+  // CIT-01: explicit candidate AND full-text coverage - a snippet-only scan
+  // is a preliminary review, never a complete substantive analysis.
   const hits = [...hitMap.values()];
-  const verdict = computeVerdict(citing.length, hits);
   const strongHits = hits.filter((h) => h.severity === "strong");
   const cautionHits = hits.filter((h) => h.severity === "caution");
   const totalCandidates = totalCitingRaw;
   const loadedCandidates = loadedRaw;
   const scannedFullText = scannedDeep;
-  const { unexaminedCandidates, analysisComplete, status: analysisStatus } = citeCoverage(
+  const {
+    unexaminedCandidates,
+    candidateCoverage,
+    fullTextCoverage,
+    analysisMode,
+    analysisComplete,
+    status: analysisStatus,
+  } = citeCoverage(
     totalCandidates,
     loadedCandidates,
     scannedFullText,
     citing.length,
     maxScan,
     deepScan,
+  );
+  // CIT-04: unknown target + zero hits is "nieustalone", never "brak_cytowan".
+  const verdict: Verdict = applyUnknownTargetRule(
+    computeVerdict(citing.length, hits),
+    target !== null,
+    totalCitingRaw,
   );
 
   const lines: string[] = [`=== CITATOR SAOS: ${caseNo} ===`, ""];
@@ -617,12 +790,21 @@ async function runCiteCheck(a: Record<string, unknown>) {
     }
   } else {
     lines.push(
-      `Orzeczenie badane: '${caseNo}' NIE znalezione w SAOS - filtr 'pozniejsze niz badane' niedostepny, ` +
-        "wyniki obejmuja wszystkie orzeczenia przywolujace te sygnature."
+      `Orzeczenie badane: '${caseNo}' NIE znalezione w SAOS - tozsamosc niezweryfikowana, ` +
+        "filtr 'pozniejsze niz badane' niedostepny, daty ponizszych orzeczen bez odniesienia. " +
+        "Jezeli laczna liczba trafien wynosi 0, oznacza to brak frazy w SAOS (m.in. literowka?), " +
+        "a NIE udowodniony brak cytowan zweryfikowanego orzeczenia."
     );
   }
   lines.push("");
   lines.push(`WERDYKT [${verdict}]: ${VERDICT_TEXT[verdict]}`);
+  if (analysisMode === "snippets_only" && citing.length > 0) {
+    lines.push(
+      "PRZEGLAD WSTEPNY - nie odczytano zadnego pelnego uzasadnienia (deepScan=false); " +
+        "werdykt oparty wylacznie na snippetach wyszukiwarki. Ustaw deepScan=true (i zwieksz maxScan), " +
+        "zeby zamknac analize merytoryczna."
+    );
+  }
   if (analysisStatus === "partial") {
     lines.push(
       "ANALIZA CZESCIOWA - werdykt dotyczy tylko zbadanej probki; " +
@@ -631,14 +813,15 @@ async function runCiteCheck(a: Record<string, unknown>) {
   }
   lines.push("");
   lines.push(
-    `Cytujace orzeczenia${targetDate ? " (pozniejsze niz " + targetDate + ")" : ""}: ` +
+    `Orzeczenia przywolujace sygnature${targetDate ? " (pozniejsze niz " + targetDate + ")" : " (bez filtra daty - badane orzeczenie nieodnalezione)"}: ` +
       `${citing.length} na tej stronie (lacznie w SAOS dla frazy: ${totalCitingRaw}), ` +
       `skan pelnych tekstow: ${scannedDeep}.`
   );
   lines.push(
     `Pokrycie: totalCandidates=${totalCandidates}, loadedCandidates=${loadedCandidates}, ` +
-      `scannedFullText=${scannedFullText}, unexaminedCandidates=${unexaminedCandidates}, ` +
-      `analysis=${analysisStatus}, strona cytowan=${citePage}.`
+      `candidateCoverage=${candidateCoverage.toFixed(3)}, scannedFullText=${scannedFullText}, ` +
+      `fullTextCoverage=${fullTextCoverage.toFixed(3)}, unexaminedCandidates=${unexaminedCandidates}, ` +
+      `analysisMode=${analysisMode}, analysis=${analysisStatus}, strona cytowan=${citePage}.`
   );
 
   if (hits.length > 0) {
@@ -655,7 +838,11 @@ async function runCiteCheck(a: Record<string, unknown>) {
 
   if (citing.length > 0) {
     lines.push("");
-    lines.push(`Najnowsze cytujace (max ${CITE_DISPLAY_LIMIT}):`);
+    lines.push(
+      target
+        ? `Najnowsze cytujace (max ${CITE_DISPLAY_LIMIT}):`
+        : `Orzeczenia zawierajace sygnature - kolejnosc BEZ filtra daty (max ${CITE_DISPLAY_LIMIT}):`
+    );
     for (const it of citing.slice(0, CITE_DISPLAY_LIMIT)) {
       lines.push(
         `- ${itemCaseNumber(it) || "brak_sygnatury"} | ${it.judgmentDate ?? "?"} | ` +
@@ -685,10 +872,13 @@ async function runCiteCheck(a: Record<string, unknown>) {
       total_citing_found: citing.length,
       total_citing_in_saos: totalCitingRaw,
       scanned_deep: scannedDeep,
-      // F-05 coverage block (new keys, old keys kept for compat).
+      // CIT-01 coverage block (new keys, old keys kept for compat).
       totalCandidates,
       loadedCandidates,
+      candidateCoverage,
       scannedFullText,
+      fullTextCoverage,
+      analysisMode,
       unexaminedCandidates,
       analysisComplete,
       status: analysisStatus,
@@ -719,7 +909,7 @@ const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy
 3. \`get_judgment\` - orzeczenie po ID numerycznym z wynikow search. Domyslnie metadata + pierwsze 2000 znakow tresci; parametry offset/limit (max 20000) skladaja caly tekst bez luk (nextOffset/hasMore w structuredContent).
 
 ### Citator - czy wyrok zyje
-4. \`saos_cite_check\` - podaj sygnature, dostaniesz: (a) pozniejsze orzeczenia cytujace ja (pelnotekstowo, stronicowane pageNumber), (b) skan uzasadnien pod frazy przelamania linii orzeczniczej W OKNIE wokol sygnatury, (c) werdykt: \`przelamanie_wykryte\` / \`uchwala_skladu_powiekszonego\` / \`nadal_cytowany\` / \`brak_cytowan_w_saos\` + status pokrycia complete/partial (totalCandidates/loadedCandidates/scannedFullText/unexaminedCandidates). Fraza opisujaca SAMO badane orzeczenie jako uchwale skladu powiekszonego NIE liczy sie jako przelamanie - wymagany jest inny sklad lub zagadnienie prawne. Kazde trafienie ma attitude: mentioned/followed/distinguished/criticized/potentially_overruled/unknown. Uzywaj PRZED zacytowaniem orzeczenia jako aktualnego. Werdykt to heurystyka - przy \`przelamanie_wykryte\` ZAWSZE zweryfikuj pelny tekst trafienia przez \`get_judgment\`. Brak trafien NIE potwierdza aktualnosci (pokrycie SAOS nierowne).
+4. \`saos_cite_check\` - podaj sygnature, dostaniesz: (a) pozniejsze orzeczenia cytujace ja (pelnotekstowo, stronicowane pageNumber), (b) skan uzasadnien pod frazy przelamania linii orzeczniczej W OKNIE wokol sygnatury, (c) werdykt: \`przelamanie_wykryte\` / \`nadal_cytowany\` / \`nieustalone\` / \`brak_cytowan_w_saos\` (+ legacy \`uchwala_skladu_powiekszonego\` w starych wynikach) + pokrycie: candidateCoverage/fullTextCoverage/analysisMode (snippets_only = PRZEGLAD WSTEPNY, nie pelna analiza)/analysisComplete/status complete-partial (totalCandidates/loadedCandidates/scannedFullText/unexaminedCandidates). Pusta strona przy dodatnim total = blad \`page_out_of_range\`, nie werdykt. Nieznana sygnatura + 0 trafien = \`nieustalone\`, nie brak cytowan. Fraza opisujaca SAMO badane orzeczenie jako uchwale skladu powiekszonego NIE liczy sie jako przelamanie - wymagany jest inny sklad lub zagadnienie prawne. Kazde trafienie ma attitude: mentioned/followed/distinguished/criticized/potentially_overruled/unknown. Uzywaj PRZED zacytowaniem orzeczenia jako aktualnego. Werdykt to heurystyka - przy \`przelamanie_wykryte\` ZAWSZE zweryfikuj pelny tekst trafienia przez \`get_judgment\`. Brak trafien NIE potwierdza aktualnosci (pokrycie SAOS nierowne).
 
 ## Twarde ograniczenia
 
@@ -893,10 +1083,13 @@ const TOOLS = [
       "przelamania linii orzeczniczej (np. 'odstepuje od pogladu wyrazonego', " +
       "'nie podziela pogladu', 'traci moc uchwala', 'uchwala skladu siedmiu sedziow') " +
       "w oknie ~500 znakow wokol wystapienia sygnatury. " +
-      "Werdykt: przelamanie_wykryte / uchwala_skladu_powiekszonego / nadal_cytowany / " +
-      "brak_cytowan_w_saos + status pokrycia complete/partial. To heurystyka - kazde trafienie ma fragment tekstu do " +
+      "Werdykt: przelamanie_wykryte / nadal_cytowany / nieustalone / " +
+      "brak_cytowan_w_saos + pokrycie candidateCoverage/fullTextCoverage/analysisMode/analysisComplete/status. " +
+      "Sygnal ostroznosci (uchwala skladu powiekszonego) sam nie przesadza o przelamaniu - daje 'nieustalone' " +
+      "z trafieniami do recznej weryfikacji. Pusta strona przy dodatnim total = blad page_out_of_range. " +
+      "To heurystyka - kazde trafienie ma fragment tekstu do " +
       "recznej weryfikacji, a brak trafien NIE potwierdza aktualnosci orzeczenia. " +
-      "Bledy: `missing_arg` (nieczytelna sygnatura), `invalid_court_type`, `upstream_error`.",
+      "Bledy: `missing_arg` (nieczytelna sygnatura), `invalid_court_type`, `page_out_of_range`, `upstream_error`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1111,9 +1304,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           };
         }
+        // F-02: surface mirror completeness signals in structured output too.
+        const sr = raw as SearchResponse;
         return {
           content: [{ type: "text", text: withSourceNote(text, source) }],
-          structuredContent: { citations: buildSearchCitations(raw), source, pagination },
+          structuredContent: {
+            citations: buildSearchCitations(raw),
+            source,
+            pagination,
+            ...(sr.mirror_gap ? { mirror_gap: sr.mirror_gap } : {}),
+            ...(sr.mirror_uncertain ? { mirror_uncertain: true, mirror_integrity: sr.mirror_integrity } : {}),
+          },
         };
       }
 
@@ -1299,17 +1500,16 @@ async function startHttp(): Promise<void> {
       return;
     }
     if (path === "/status") {
-      // F-04: optional bearer gate. If STATUS_TOKEN is set, the endpoint
-      // requires `Authorization: Bearer <token>`; otherwise it serves the
-      // REDACTED diagnostics only (store.stats() carries hashes, not queries).
+      // F-04: bearer gate on the Authorization HEADER only - tokens must
+      // never travel in the URL query string (proxy logs, shell history).
+      // Token configured + valid Bearer -> full diagnostics (incl. recent
+      // discrepancy hashes). Otherwise -> minimal public subset with COUNTS
+      // only, never per-query detail. /healthz stays the user-data-free probe.
       const token = process.env.STATUS_TOKEN;
-      if (token) {
-        const auth = req.headers.authorization ?? "";
-        const qsToken = new URL(req.url ?? "/", "http://x").searchParams.get("token");
-        if (auth !== `Bearer ${token}` && qsToken !== token) {
-          sendJson(res, 401, { error: "unauthorized" });
-          return;
-        }
+      const authorized = isStatusAuthorized(req.headers, token);
+      if (token && !authorized) {
+        sendJson(res, 401, { error: "unauthorized" });
+        return;
       }
       const store = localStore();
       const base = {
@@ -1319,17 +1519,17 @@ async function startHttp(): Promise<void> {
         dataSource: "local_dump+saos_api",
         sync_running: syncRunning,
       };
+      const payload = buildStatusPayload(base, store ? store.stats() : null, authorized, Boolean(token));
       sendJson(
         res,
         200,
         store
           ? {
-              ...base,
-              ...store.stats(),
+              ...payload,
               lastSync: store.getState("last_sync"),
               indexStatus: store.mirrorIntegrity(),
             }
-          : { ...base, local: false }
+          : payload
       );
       return;
     }
