@@ -217,13 +217,13 @@ export const DEFAULT_FRAGMENT_RADIUS = 200;
 /** Usuwa HTML i normalizuje biale znaki - tekst gotowy do skanu. */
 export function normalizeText(html: string): string {
   return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
+    .replace(/<[^<>]*>/g, " ")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&") // last: avoids double-unescaping (&amp;lt; -> &lt;)
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -296,6 +296,59 @@ export type Verdict =
   | "uchwala_skladu_powiekszonego"
   | "nadal_cytowany"
   | "brak_cytowan_w_saos";
+
+/**
+ * F-06: attitude of a citing fragment toward the examined judgment.
+ * Kept alongside the 4 legacy verdicts (backward compat) - each hit carries
+ * its own attitude so agents can tell `mentioned` from `potentially_overruled`.
+ */
+export type CitationAttitude =
+  | "mentioned"
+  | "followed"
+  | "distinguished"
+  | "criticized"
+  | "potentially_overruled"
+  | "unknown";
+
+export function attitudeForLabel(label: string, severity: Severity): CitationAttitude {
+  if (severity === "strong") {
+    if (label === "odstapienie_od_pogladu" || label === "utrata_mocy_uchwaly")
+      return "potentially_overruled";
+    return "criticized";
+  }
+  if (label === "zagadnienie_prawne") return "unknown";
+  return "unknown";
+}
+
+/**
+ * F-06: does this fragment only describe the EXAMINED judgment itself as an
+ * enlarged-panel resolution ("uchwala skladu siedmiu sedziow ... III CZP 6/21")?
+ * Such a self-description is NOT evidence of a later break in the case-law
+ * line. Keep the caution hit only when the window shows ANOTHER resolution:
+ * a distinct case signature, or a real referred legal question in context.
+ */
+export function isSelfDescription(
+  fragment: string,
+  targetCaseNumber: string,
+  targetDate?: string,
+): boolean {
+  CASE_NO_RE.lastIndex = 0;
+  const found = new Set<string>();
+  let m: RegExpExecArray | null;
+  const norm = (s: string) => s.replace(/\s*\/\s*/gu, "/").replace(/\s+/gu, " ").trim().toLowerCase();
+  const target = norm(targetCaseNumber);
+  while ((m = CASE_NO_RE.exec(fragment)) !== null) {
+    const sig = norm(m[0].replace(/\s*\/\s*/gu, "/").replace(/\s+/gu, " ").trim());
+    if (sig) found.add(sig);
+  }
+  found.delete(target);
+  // A second, distinct signature in the window = plausibly another resolution.
+  if (found.size > 0) return false;
+  // A legal question referred alongside = real downstream signal even alone.
+  if (/zagadnieni[ea][\sa-ząćęłńóśźż]*prawn/i.test(fragment)) return false;
+  void targetDate;
+  return true;
+}
 
 export function computeVerdict(
   totalCiting: number,

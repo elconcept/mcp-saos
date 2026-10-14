@@ -3,6 +3,70 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-14
+
+Audyt funkcjonalny, regresyjny i architektoniczny (memo 2026-10-13, ustalenia
+F-01…F-11). **Backward-compatible**: te same 4 narzedzia i nazwy; nowe pola sa
+opcjonalne (offset/limit, pageNumber citatora) lub dodatkowe w
+structuredContent (pagination, chunk, coverage). Fork elconcept zachowany -
+lokalny mirror SQLite/FTS5 nadal glownym silnikiem, SAOS API fallbackiem.
+
+### Added
+
+- `get_judgment(id, offset?, limit?)` (F-01): odczyt calej tresci partiami
+  (limit max 20000, domyslnie 2000 jak w 1.3.x); structuredContent niesie
+  `totalLength`, `returnedLength`, `offset`, `hasMore`, `nextOffset`, `truncated`.
+- `search`: structuredContent.pagination (`pageNumber`, `pageSize`,
+  `totalResults`, `totalPages`, `hasMore`, `nextPage`) (F-08).
+- `saos_cite_check`: parametr `pageNumber` (stronicowanie listy cytujacych,
+  100/strona) oraz jawne pokrycie w structuredContent: `totalCandidates`,
+  `loadedCandidates`, `scannedFullText`, `unexaminedCandidates`,
+  `analysisComplete`, `status` (complete/partial); przy analizie niepelnej
+  werdykt ma adnotacje ANALIZA CZESCIOWA (F-05).
+- Kazde trafienie citatora ma `attitude`: mentioned / followed / distinguished /
+  criticized / potentially_overruled / unknown (F-06).
+- Nowe kody bledow: `invalid_arg`, `invalid_date`, `page_out_of_range`; kazdy
+  blad niesie `fault` (caller/upstream/network), `retryable`, oraz `status` /
+  `retry_after_s` gdy dotyczy (F-07, F-09).
+- `GET /status`: `buildVersion`, `gitCommit` (ze zmiennych BUILD_VERSION /
+  GIT_COMMIT), `dataSource`, `lastSync`, `indexStatus` (complete / partial /
+  stale / unverified); opcjonalna bramka `STATUS_TOKEN` (Bearer) (F-04, F-11).
+- Okna synchronizacji maja statusy `verified` / `degraded` / `failed` /
+  `retry_pending` (`shortfall`, `checked_at`); agregat w `/status`
+  (`windows_verified/degraded/failed`, `index_status`) (F-02, F-03).
+- `Store.mirrorIntegrity()`, `Store.close()`, `hashParams()`,
+  `isValidIsoDate()`, `citeCoverage()`, `classifyHttpError()` / `HttpError`
+  (status, retryAfterS) - do testow i diagnostyki.
+- Testy akceptacyjne `test/acceptance.test.mjs` (14 testow, offline, mapowanie
+  na 11 scenariuszy odbioru z memo); `npm run test:unit` obejmuje je razem z
+  `cite-check.test.mjs`.
+
+### Fixed
+
+- Bledne daty (`xyz`, `2021-13-01`, `2021-02-30`) zwracaja `invalid_date`
+  (fault=caller) zamiast cichego ignorowania filtra lub falszywego zera (F-07).
+- Strona poza zakresem przy totalResults>0 zwraca `[page_out_of_range]` z
+  prawdziwa liczba wynikow i paginacja, nie "brak orzeczen" (F-08).
+- Upstream 404 -> `not_found`, upstream 400 -> `invalid_arg`; `id: 0` i `"abc"`
+  to `invalid_arg`, nie `missing_arg` ani `upstream_error` (F-09).
+- Citator odrzuca frazy skladu powiekszonego opisujace SAMO badane orzeczenie
+  (np. "uchwala skladu siedmiu sedziow ... III CZP 6/21" bez innej sygnatury) -
+  sygnal caution wymaga innej uchwaly albo zagadnienia prawnego (F-06).
+- `GET /status` nie ujawnia surowych parametrow zapytan ani ID upstream
+  (tylko `params_hash` i liczniki); logi stderr tez haszuja parametry (F-04).
+- Nieudana / niepelna synchronizacja okna raportowana jest jako `degraded` /
+  `failed`, nigdy jako pelny sukces (F-03).
+- HTTP: brak rotacji obwodu Tor przy 401/403 (kontrola dostepu zrodla);
+  429 respektuje `Retry-After` (sek. 5 memo).
+- Dokumentacja: `get_judgment` nie obiecuje juz "pelnego orzeczenia" bez
+  zastrzezen (offset/limit); rozroznienie `legalBase` (indeks legalBases -
+  podstawa rozstrzygniecia) vs `referencedRegulation` (indeks
+  referencedRegulations - kazde przywolanie) w opisach narzedzi, README i
+  AGENTS.md; `package.json` wskazuje repozytorium forka (F-10, F-11).
+- Import `dist/index.js` / `dist/sync.js` nie startuje juz serwera ani
+  synchronizacji (straznik `require.main === module`) - do testowania bez
+  efektow ubocznych.
+
 ## [1.3.0] - 2026-10-12
 
 Lokalna kopia dumpu SAOS jako silnik wyszukiwania (fork elconcept). **Backward-compatible** - narzedzia, schematy i opisy bez zmian (descriptor lock OK).

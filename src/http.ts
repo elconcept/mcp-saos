@@ -31,10 +31,59 @@ async function torAgent(): Promise<http.Agent | undefined> {
   return new SocksProxyAgent(u.toString());
 }
 
-class HttpError extends Error {
-  constructor(message: string, readonly status: number) {
+export class HttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfterS?: number,
+  ) {
     super(message);
   }
+}
+
+/** Structured upstream fault - returned to MCP clients, never as empty results. */
+export interface UpstreamFault {
+  code: "not_found" | "invalid_arg" | "upstream_error";
+  /** caller = bad tool argument, upstream = SAOS side, network = transport */
+  fault: "caller" | "upstream" | "network";
+  retryable: boolean;
+  status?: number;
+  retryAfterS?: number;
+}
+
+/** Map an HTTP failure to a structured fault (cf. upstream 1.3.1 saos-http.ts). */
+export function classifyHttpError(err: unknown): UpstreamFault {
+  if (err instanceof HttpError) {
+    if (err.status === 404)
+      return { code: "not_found", fault: "upstream", retryable: false, status: 404 };
+    if (err.status === 400)
+      return { code: "invalid_arg", fault: "caller", retryable: false, status: 400 };
+    if (err.status === 401 || err.status === 403)
+      return { code: "upstream_error", fault: "upstream", retryable: false, status: err.status };
+    if (err.status === 429)
+      return {
+        code: "upstream_error",
+        fault: "upstream",
+        retryable: true,
+        status: 429,
+        ...(err.retryAfterS !== undefined ? { retryAfterS: err.retryAfterS } : {}),
+      };
+    if (err.status >= 500)
+      return { code: "upstream_error", fault: "upstream", retryable: true, status: err.status };
+    return { code: "upstream_error", fault: "upstream", retryable: false, status: err.status };
+  }
+  return { code: "upstream_error", fault: "network", retryable: true };
+}
+
+function parseRetryAfter(headers: Record<string, string | string[] | undefined>): number | undefined {
+  const v = headers["retry-after"];
+  const s = Array.isArray(v) ? v[0] : v;
+  if (!s) return undefined;
+  const n = Number(s);
+  if (Number.isFinite(n) && n >= 0) return Math.min(600, Math.floor(n));
+  const t = Date.parse(s);
+  if (Number.isFinite(t)) return Math.max(0, Math.min(600, Math.floor((t - Date.now()) / 1000)));
+  return undefined;
 }
 
 function fetchOnce(urlStr: string, timeoutMs: number, agent?: http.Agent): Promise<unknown> {
@@ -60,7 +109,13 @@ function fetchOnce(urlStr: string, timeoutMs: number, agent?: http.Agent): Promi
       res.on("end", () => {
         const body = Buffer.concat(chunks).toString("utf-8");
         if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new HttpError(`HTTP ${res.statusCode}: ${body.slice(0, 300)}`, res.statusCode ?? 0));
+          reject(
+            new HttpError(
+              `HTTP ${res.statusCode}: ${body.slice(0, 300)}`,
+              res.statusCode ?? 0,
+              parseRetryAfter(res.headers as Record<string, string | string[] | undefined>),
+            ),
+          );
           return;
         }
         try {
@@ -90,12 +145,22 @@ export async function fetchJson(urlStr: string, opts: FetchOptions = {}): Promis
       return await fetchOnce(urlStr, timeoutMs, i > 0 ? await torAgent() : undefined);
     } catch (err) {
       lastErr = err;
+      // 401/403 = access control by the source: NEVER rotate exit IP to work
+      // around it (F memo, sec. 5). No retry at all.
+      if (err instanceof HttpError && (err.status === 401 || err.status === 403)) {
+        throw err;
+      }
       // 4xx other than 403/429 = bad request / not found - retrying will not help.
       if (err instanceof HttpError && err.status >= 400 && err.status < 500 && err.status !== 403 && err.status !== 429) {
         throw err;
       }
       if (i < attempts - 1) {
-        await new Promise((r) => setTimeout(r, Math.min(60000, 2000 * 2 ** i)));
+        // 429: honour Retry-After instead of the exponential default.
+        const wait =
+          err instanceof HttpError && err.status === 429 && err.retryAfterS !== undefined
+            ? Math.min(600000, err.retryAfterS * 1000)
+            : Math.min(60000, 2000 * 2 ** i);
+        await new Promise((r) => setTimeout(r, wait));
       }
     }
   }
