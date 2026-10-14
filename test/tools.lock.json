@@ -1,6 +1,6 @@
 {
-  "package_version": "1.4.0",
-  "toolset_sha256": "f91045b98b6ed2e26d8606b58f2097d4219d7d0d757a0c468ed9200a1de8bc5d",
+  "package_version": "1.5.0",
+  "toolset_sha256": "bbca3d7d2c636448a4204dff2a69a2b23638e34ae73570e71f62b813fe8aad9b",
   "tools": {
     "get_judgment": {
       "sha256": "eb8852ed025d90624d28eebb037c4a628bfa1b6360574da1bdd73df31705ea50",
@@ -42,7 +42,7 @@
       }
     },
     "saos_cite_check": {
-      "sha256": "ea3fd3deacabc97faa8b44646bc7d58d0dc99cc81cdc854c68497c351a459322",
+      "sha256": "c5c2141cee0da783cccb6576fbd5020dc69b70f52ed80359f2216c5546fc47f0",
       "descriptor": {
         "annotations": {
           "destructiveHint": false,
@@ -50,7 +50,7 @@
           "openWorldHint": true,
           "readOnlyHint": true
         },
-        "description": "Citator 'czy wyrok zyje': dla podanej sygnatury szuka POZNIEJSZYCH orzeczen, ktore ja cytuja (pelnotekstowo w SAOS), i skanuje ich uzasadnienia pod frazy przelamania linii orzeczniczej (np. 'odstepuje od pogladu wyrazonego', 'nie podziela pogladu', 'traci moc uchwala', 'uchwala skladu siedmiu sedziow') w oknie ~500 znakow wokol wystapienia sygnatury. Werdykt: przelamanie_wykryte / uchwala_skladu_powiekszonego / nadal_cytowany / brak_cytowan_w_saos + status pokrycia complete/partial. To heurystyka - kazde trafienie ma fragment tekstu do recznej weryfikacji, a brak trafien NIE potwierdza aktualnosci orzeczenia. Bledy: `missing_arg` (nieczytelna sygnatura), `invalid_court_type`, `upstream_error`.",
+        "description": "Citator 'czy wyrok zyje': dla podanej sygnatury szuka POZNIEJSZYCH orzeczen, ktore ja cytuja (pelnotekstowo w SAOS), i skanuje ich uzasadnienia pod frazy przelamania linii orzeczniczej (np. 'odstepuje od pogladu wyrazonego', 'nie podziela pogladu', 'traci moc uchwala', 'uchwala skladu siedmiu sedziow') w oknie ~500 znakow wokol wystapienia sygnatury. Werdykt: przelamanie_wykryte / nadal_cytowany / nieustalone / brak_cytowan_w_saos + pokrycie candidateCoverage/fullTextCoverage/analysisMode/analysisComplete/status. Sygnal ostroznosci (uchwala skladu powiekszonego) sam nie przesadza o przelamaniu - daje 'nieustalone' z trafieniami do recznej weryfikacji. Pusta strona przy dodatnim total = blad page_out_of_range. To heurystyka - kazde trafienie ma fragment tekstu do recznej weryfikacji, a brak trafien NIE potwierdza aktualnosci orzeczenia. Bledy: `missing_arg` (nieczytelna sygnatura), `invalid_court_type`, `page_out_of_range`, `upstream_error`.",
         "inputSchema": {
           "properties": {
             "caseNumber": {

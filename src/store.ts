@@ -74,6 +74,21 @@ export function defaultDbPath(): string {
   return process.env.SAOS_DB ?? "/data/saos.sqlite";
 }
 
+/**
+ * F-03: explicit repair queue - ranges of degraded windows for operators
+ * (capped; counts are in stats()). Operational metadata, no user data.
+ */
+export function degradedRanges(s: { db: import("node:sqlite").DatabaseSync }): string[] {
+  try {
+    const rows = s.db
+      .prepare("SELECT start, end FROM windows WHERE status = 'degraded' ORDER BY start LIMIT 50")
+      .all() as Array<{ start: string; end: string }>;
+    return rows.map((r) => `${r.start}..${r.end}`);
+  } catch {
+    return [];
+  }
+}
+
 function legalText(v: unknown): string {
   if (typeof v === "string") return v;
   if (v && typeof v === "object") {
@@ -222,8 +237,7 @@ export class Store {
 
   // --- reads ---------------------------------------------------------------
 
-  /** Division object shaped like the SAOS REST API (court / chamber names). */
-  division(courtType: string | undefined, id: number | undefined): Record<string, unknown> | null {
+  /** Division object shaped like the SAOS REST API (court / chamber names). */  division(courtType: string | undefined, id: number | undefined): Record<string, unknown> | null {
     if ((courtType !== "COMMON" && courtType !== "SUPREME") || id === undefined) return null;
     const key = `${courtType}:${id}`;
     if (!this.divCache.has(key)) {
@@ -277,8 +291,12 @@ export class Store {
         return null;
       }
     };
+    // F-03: explicit repair queue - degraded window RANGES for operators,
+    // plus legacy (pre-status) rows awaiting re-verification.
     // F-04: public diagnostics NEVER carry raw query params or upstream ids
     // (PII / query-content leak via GET /status). Only hashes + counts.
+    // Full per-query detail additionally requires STATUS_TOKEN bearer auth
+    // (buildStatusPayload in index.ts strips recent_discrepancies otherwise).
     let recent: Array<Record<string, unknown>> = [];
     try {
       const rows = this.stmt(
@@ -302,6 +320,10 @@ export class Store {
       windows_verified: winStatus("verified"),
       windows_degraded: winStatus("degraded"),
       windows_failed: winStatus("failed"),
+      windows_legacy: one(
+        "SELECT count(*) AS n FROM windows WHERE status NOT IN ('verified', 'degraded', 'failed')"
+      ),
+      degraded_windows: degradedRanges(this),
       discrepancies: one("SELECT count(*) AS n FROM discrepancies"),
       initial_complete: this.isReady(),
       last_sync: this.getState("last_sync"),
@@ -333,8 +355,16 @@ export class Store {
     const degraded = one("SELECT count(*) AS n FROM windows WHERE status = 'degraded'");
     const failed = one("SELECT count(*) AS n FROM windows WHERE status = 'failed'");
     const pending = one("SELECT count(*) AS n FROM windows WHERE completed_at IS NULL");
+    // F-03: pre-1.4.0 rows carry the migration default ('retry_pending') with
+    // completed_at set - attempted but NEVER verified. They must not read as
+    // complete; the sync recheck pass promotes them to verified/degraded.
+    const legacy = one(
+      "SELECT count(*) AS n FROM windows WHERE status NOT IN ('verified', 'degraded', 'failed')"
+    );
     if (failed > 0 || pending > 0)
       return { status: "partial", detail: `${failed} failed, ${pending} pending of ${total} windows` };
+    if (legacy > 0)
+      return { status: "partial", detail: `${legacy} windows with legacy status need re-verification of ${total}` };
     if (degraded > 0)
       return { status: "partial", detail: `${degraded} degraded of ${total} windows` };
     const last = Date.parse(this.getState("last_sync") ?? "") || 0;
