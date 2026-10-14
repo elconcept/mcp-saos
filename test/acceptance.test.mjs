@@ -205,12 +205,15 @@ test("AC7: partial coverage is explicit (5388 total, 100 loaded, 3 scanned)", ()
 // 8+9. Partial mirror detectable; degraded window is not success (F-02/F-03)
 // ---------------------------------------------------------------------------
 
+// node:sqlite needs Node >= 22.13; the server degrades without it, so do these tests.
+const hasSqlite = await import("node:sqlite").then(() => true, () => false);
+
 function tempStore() {
   const dir = mkdtempSync(join(tmpdir(), "saos-"));
   return new Store(join(dir, "t.sqlite"));
 }
 
-test("AC8/AC9: degraded windows make the mirror partial, never complete", () => {
+test("AC8/AC9: degraded windows make the mirror partial, never complete", { skip: !hasSqlite && "node:sqlite unavailable" }, () => {
   const s = tempStore();
   try {
     assert.equal(s.mirrorIntegrity().status, "unverified");
@@ -240,7 +243,7 @@ test("AC8/AC9: degraded windows make the mirror partial, never complete", () => 
 // 10. Public diagnostics carry no raw queries or PII (F-04)
 // ---------------------------------------------------------------------------
 
-test("AC10: stats() redacts discrepancy params to hashes", () => {
+test("AC10: stats() redacts discrepancy params to hashes", { skip: !hasSqlite && "node:sqlite unavailable" }, () => {
   const s = tempStore();
   try {
     s.logDiscrepancy("search", { all: "Jan Kowalski PESEL 123", caseNumber: "I ACa 1/20" }, 2, [1, 2]);

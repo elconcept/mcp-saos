@@ -11,14 +11,17 @@ permissions:
 
 jobs:
   build:
-    name: Build (Node 20)
+    name: Build (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - run: npm ci

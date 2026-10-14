@@ -217,13 +217,13 @@ export const DEFAULT_FRAGMENT_RADIUS = 200;
 /** Usuwa HTML i normalizuje biale znaki - tekst gotowy do skanu. */
 export function normalizeText(html: string): string {
   return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&")
+    .replace(/<[^<>]*>/g, " ")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&") // last: avoids double-unescaping (&amp;lt; -> &lt;)
     .replace(/\s+/g, " ")
     .trim();
 }
