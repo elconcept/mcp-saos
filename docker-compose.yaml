@@ -1,5 +1,5 @@
 # mcp-saos - orzeczenia SAOS z lokalnej kopii dumpu (Streamable HTTP, /mcp). Stack Portainera "mcp-saos".
-# Bez portu na hoscie. Dostep wylacznie: https://mcp-saos.xlap.pl/mcp - tunel cloudflared + Access (Managed OAuth).
+# Port na hoscie 8402 (LAN, bez autoryzacji: http://10.0.10.201:8402/mcp). Z internetu: https://mcp-saos.xlap.pl/mcp - tunel cloudflared + Access (Managed OAuth).
 # cf_mcp_saos: cloudflared + ten serwis, z wyjsciem do internetu (API/dump SAOS, Tor awaryjnie).
 # /data: baza SQLite (~30 GB po pelnym pobraniu); pierwsze pobranie wznawia sie po restarcie,
 # potem codziennie o SAOS_SYNC_AT przyrostowo (sinceModificationDate). Stan: GET /status (przez tunel).
@@ -15,6 +15,8 @@ services:
       - SAOS_SYNC_CONCURRENCY=3
     volumes:
       - /volume2/docker/mcp-saos/data:/data
+    ports:
+      - "8402:8000"
     networks:
       - cf_mcp_saos
     healthcheck:
