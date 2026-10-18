@@ -6,12 +6,14 @@ that a judgment does not exist. No external search or proxy bypass is used.
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from vendor import orzeczenia_ms as portal
+from ms_cache import MsCache
 
 mcp = FastMCP(
     "mcp-orzeczenia-ms",
@@ -27,6 +29,7 @@ mcp = FastMCP(
 _lock = threading.Lock()
 _client = portal.Client()
 _ORIGIN = "https://orzeczenia.ms.gov.pl"
+_cache = MsCache(os.environ.get("MS_CACHE_DB", "/tmp/ms-discovered.sqlite"))
 
 
 def _result(status: str, **data: Any) -> dict[str, Any]:
@@ -44,8 +47,22 @@ def _invoke(arguments: list[str]) -> dict[str, Any]:
         try:
             parsed = portal.parser().parse_args(arguments)
             value = portal.run(parsed, _client)
-            # Keep all helper 'uwagi'; no invented text or finality status.
-            return _result("ok", result=value)
+            # Cache only items observed directly at MS; the source remains
+            # authoritative. Failed cache writes do not destroy fetched results.
+            output = _result("ok", result=value)
+            if isinstance(value, dict):
+                command = parsed.command
+                if command in ("szukaj", "sygnatura", "rss"):
+                    records = value.get("wyniki", [])
+                elif command in ("metryka", "orzeczenie", "przepisy"):
+                    records = [value]
+                else:
+                    records = []
+                try:
+                    output["cached_records"] = _cache.upsert(records)
+                except Exception:
+                    output["cache_warning"] = "MS result returned, but local discovery cache could not be updated"
+            return output
         except portal.Empty as exc:
             # This is ONLY a confirmed "no results" on a recognized MS page.
             return _result("not_found", message=str(exc))
@@ -162,6 +179,52 @@ def ms_recent_rss(limit: int = 10, court_code: str | None = None) -> dict[str, A
     except ValueError as exc:
         return _result("invalid_arg", message=str(exc))
 
+
+
+@mcp.tool()
+def ms_search_cached(query: str, case_number: bool = False, limit: int = 10) -> dict[str, Any]:
+    """Search ONLY the separate local MS-discovered FTS index, without network access.
+
+    These are records encountered on previous queries, NOT the full MS corpus.
+    The result distinguishes the presence of full text from a mere snippet.
+    """
+    try:
+        _safe_text(query)
+        if not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise ValueError("limit must be 1..50")
+        with _lock:
+            rows = _cache.search(query, case_number=case_number, limit=limit)
+        return _result(
+            "ok", storage="ms_discovery_cache", results=rows,
+            count=len(rows), exhaustive=False,
+        )
+    except ValueError as exc:
+        return _result("invalid_arg", message=str(exc))
+    except Exception:
+        return _result("cache_error", message="MS local discovery index is unavailable")
+
+
+@mcp.tool()
+def ms_get_cached(judgment_id: str) -> dict[str, Any]:
+    """Read a previously discovered MS record, possibly with full cached text.
+
+    Does not assert the public portal is currently reachable or that the
+    document is the final/current version.
+    """
+    try:
+        _safe_text(judgment_id, limit=190)
+        with _lock:
+            row = _cache.get(judgment_id)
+        return _result(
+            "ok" if row else "not_found",
+            storage="ms_discovery_cache",
+            record=row,
+            exhaustive=False,
+        )
+    except ValueError as exc:
+        return _result("invalid_arg", message=str(exc))
+    except Exception:
+        return _result("cache_error", message="MS local discovery index is unavailable")
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
