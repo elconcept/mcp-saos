@@ -26,7 +26,7 @@ class TestMSCache(unittest.TestCase):
         self.temp.cleanup()
 
     def sample(self, **fields):
-        return dict(
+        return dict(dict(
             id=_ID,
             sygnatura="I C 2715/21",
             sad="Sąd Okręgowy w Krakowie",
@@ -35,8 +35,7 @@ class TestMSCache(unittest.TestCase):
             data_publikacji="2024-08-22",
             url="https://orzeczenia.ms.gov.pl/details/$N/" + _ID,
             fragment="odpowiedzialność cywilna",
-            **fields,
-        )
+        ), **fields)
 
     def test_cache_remains_separate_and_reusable(self):
         self.assertEqual(self.cache.upsert([self.sample()]), 1)
