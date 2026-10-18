@@ -369,3 +369,44 @@ test("AC11b: invalid id and invalid date fail offline with caller faults", async
     stop();
   }
 });
+
+
+// Local mirror contains only a subset of SAOS: the live cross-check must not
+// turn a blocked API / malformed response into a plausible "no results" answer.
+test("local miss: live positive result wins, even for an out-of-range page", async () => {
+  const { crossCheckLocalMiss } = await import("../dist/engine.js");
+  const observed = [];
+  const live = { items: [], info: { totalResults: 7 }, links: [] };
+  const result = await crossCheckLocalMiss(
+    { caseNumber: "III CZP 6/21", pageNumber: 100 }, "search_by_case",
+    (total, ids) => observed.push([total, ids]),
+    async () => live,
+  );
+  assert.equal(result.source, "saos_api_fallback");
+  assert.deepEqual(result.data, live);
+  assert.deepEqual(observed, [[7, []]]);
+});
+
+test("local miss: explicit live zero is verified, not just assumed from dump", async () => {
+  const { crossCheckLocalMiss } = await import("../dist/engine.js");
+  let called = false;
+  const result = await crossCheckLocalMiss({}, "search", () => {
+    called = true;
+  }, async () => ({ items: [], info: { totalResults: 0 } }));
+  assert.equal(result.source, "saos_api_verified_empty");
+  assert.equal(called, false);
+});
+
+test("local miss: upstream errors and malformed JSON are never swallowed", async () => {
+  const { crossCheckLocalMiss } = await import("../dist/engine.js");
+  await assert.rejects(
+    () => crossCheckLocalMiss({}, "search", () => {}, async () => {
+      throw new Error("SAOS API timeout");
+    }),
+    /SAOS API timeout/,
+  );
+  await assert.rejects(
+    () => crossCheckLocalMiss({}, "search", () => {}, async () => ({})),
+    /Invalid SAOS API search response/,
+  );
+});
