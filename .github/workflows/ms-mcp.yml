@@ -1,0 +1,22 @@
+name: MS MCP pilot tests
+on:
+  pull_request:
+    paths:
+      - "ms-mcp/**"
+      - ".github/workflows/ms-mcp.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ms-mcp/**"
+      - ".github/workflows/ms-mcp.yml"
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r ms-mcp/requirements.txt
+      - run: python -m unittest discover -s ms-mcp/tests -v
+      - run: python -m py_compile ms-mcp/server.py ms-mcp/vendor/orzeczenia_ms.py
