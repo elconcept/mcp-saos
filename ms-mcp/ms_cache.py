@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import closing
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,7 +52,7 @@ class MsCache:
         saved = 0
         if not records:
             return saved
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             for rec in records:
                 ident = rec.get("id")
                 url = rec.get("url")
@@ -98,7 +99,7 @@ class MsCache:
 
     def search(self, query: str, *, case_number: bool = False, limit: int = 10) -> list[dict[str, Any]]:
         limit = min(50, max(1, limit))
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             if case_number:
                 rows = db.execute(
                     """SELECT * FROM ms_judgments WHERE lower(sygnatura)=lower(?)
@@ -123,7 +124,7 @@ class MsCache:
             ]
 
     def get(self, ident: str) -> dict[str, Any] | None:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             row = db.execute("SELECT * FROM ms_judgments WHERE id=?", (ident,)).fetchone()
             return (
                 {k: row[k] for k in row.keys() if k != "details_json"}
@@ -132,5 +133,5 @@ class MsCache:
             )
 
     def count(self) -> int:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             return int(db.execute("SELECT count(*) FROM ms_judgments").fetchone()[0])
