@@ -65,3 +65,19 @@ common-court coverage. Track unknown/partial coverage explicitly.
 - [ ] Confirm portal authorization and Cloudflare Access fail-closed
 - [ ] Add routing/federation logic and duplicate tests
 - [ ] Observe limits and contact portal owner for bulk/automated access policy
+
+
+## Independent discovery store
+
+\`MS_CACHE_DB=/data/ms-discovered.sqlite\` is an independent SQLite + FTS5
+database, with its own NAS bind mount, separate from the SAOS dump and its
+incremental synchronization. MS search, metadata and full-text reads append
+records ONLY after successful source responses. \`ms_search_cached\` searches
+the records collected so far; \`ms_get_cached\` returns one. The full-text
+availability flag tells snippet-only records from verified full texts.
+A local cache miss is not a source-level miss. The cache can be rebuilt from
+subsequent searches; no bulk spider or ongoing whole-portal scrape is started.
+
+On Synology, provision writable NAS folder
+\`/volume2/docker/mcp-orzeczenia-ms-state\` owned by UID 1026, GID 100
+before launching the pilot stack. Keep it separate from \`mcp-saos/data\`.
