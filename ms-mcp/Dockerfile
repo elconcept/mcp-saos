@@ -3,7 +3,7 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 COPY ms-mcp/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-COPY ms-mcp/server.py /app/server.py
+COPY ms-mcp/server.py ms-mcp/ms_cache.py /app/
 COPY ms-mcp/vendor /app/vendor
 RUN python -m py_compile server.py vendor/orzeczenia_ms.py
 EXPOSE 8000
