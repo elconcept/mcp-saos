@@ -1,0 +1,24 @@
+# Optional standalone service; NOT part of mcp-saos deploy.
+# Use a separately authenticated Cloudflare Access application and tunnel
+# route to mcp-orzeczenia-ms:8000 BEFORE adding this MCP to LEX Portal.
+services:
+  mcp-orzeczenia-ms:
+    build:
+      context: ..
+      dockerfile: ms-mcp/Dockerfile
+    image: mcp-orzeczenia-ms:pilot
+    container_name: mcp-orzeczenia-ms
+    restart: unless-stopped
+    # No host port: only the existing, private tunnel network.
+    networks:
+      - cf_mcp_saos
+    read_only: true
+    user: "65534:65534"
+    tmpfs:
+      - /tmp:size=32m
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+networks:
+  cf_mcp_saos:
+    external: true
