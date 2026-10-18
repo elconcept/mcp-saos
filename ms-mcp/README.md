@@ -13,6 +13,8 @@ stack; launch only after authorization and routing is configured.
 - \`ms_get_judgment\`: full text if the source actually serves it.
 - \`ms_get_regulations\`: source's cited-regulations tab (not authoritative/complete).
 - \`ms_recent_rss\`: recent-publication subset, not a bulk sync mechanism.
+- \`ms_search_cached\`: FTS5 search of previously encountered MS records only.
+- \`ms_get_cached\`: read metadata and optional full text from the MS-only store.
 
 All tool results include explicit \`source=portal_orzeczen_ms\`,
 \`coverage=published_selection_only\`, and \`status\`:
