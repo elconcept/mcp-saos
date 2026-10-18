@@ -367,13 +367,16 @@ function buildJudgmentCitation(raw: unknown): SaosCitation | null {
 function combineSources(sources: Set<Source>): Source {
   if (sources.has("saos_api_fallback")) return "saos_api_fallback";
   if (sources.has("saos_api")) return "saos_api";
+  if (sources.has("saos_api_verified_empty")) return "saos_api_verified_empty";
   return "local_dump";
 }
 
 function sourceNote(source: Source): string {
-  return source === "saos_api_fallback"
-    ? "Uwaga: wynik pobrany z API SAOS - brak go w lokalnej kopii bazy (rozbieznosc zarejestrowana do weryfikacji)."
-    : "";
+  if (source === "saos_api_fallback")
+    return "Uwaga: wynik pobrany z API SAOS - brak go w lokalnej kopii bazy (rozbieznosc zarejestrowana do weryfikacji).";
+  if (source === "saos_api_verified_empty")
+    return "Brak trafien potwierdzono w lokalnym dumpie i w odpowiedzi API SAOS. SAOS nie obejmuje wszystkich opublikowanych orzeczen; sprawdz rowniez Portal Orzeczen MS.";
+  return "";
 }
 
 function withSourceNote(text: string, source: Source): string {
@@ -726,7 +729,7 @@ const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy
 - **Pokrycie nierowne** - sady powszechne dobrze, SN/TK/KIO obecne. **Sady administracyjne (WSA/NSA) NIE sa w SAOS** - dla nich uzyj mcp-nsa (orzeczenia.nsa.gov.pl).
 - **Daty znieksztalcone przez OCR** - mozesz zobaczyc "rok 3013" lub inne nielogiczne. Domyslny upper bound to dzisiaj, zeby OCR-mangled daty nie zalaly DESC sort. Weryfikuj sygnature i date w zrodle (saos.org.pl/judgments/{id}).
 - **Bez modyfikacji tresci** - zwracamy verbatim z SAOS. NIE prosc o parafraze "lepszym jezykiem" - to wartosc dowodowa.
-- **Zrodlo danych** - lokalna kopia dumpu SAOS (pelna baza, aktualizacja przyrostowa raz dziennie - orzeczenia opublikowane w SAOS dzisiaj moga pojawic sie jutro). Gdy lokalnie brak wyniku, serwer pyta API SAOS; wynik z API ma \`structuredContent.source\` = \`saos_api_fallback\` i adnotacje w tekscie. NIE polegaj na ciaglosci sesji.
+- **Zrodlo danych** - lokalna kopia dumpu SAOS (NIEPELNA baza; aktualizacja przyrostowa raz dziennie - orzeczenia opublikowane w SAOS dzisiaj moga pojawic sie jutro). Gdy lokalnie brak wyniku, serwer pyta API SAOS; w razie niedostepnosci API zwraca upstream_error, NIGDY falszywego zera. Potwierdzony brak w obu zrodlach oznacza source=saos_api_verified_empty. Wynik z API ma \`structuredContent.source\` = \`saos_api_fallback\` i adnotacje w tekscie. NIE polegaj na ciaglosci sesji.
 - **\`structuredContent.citations\`** zawsze wypelnione: title, url (saos.org.pl/judgments/{id}), case_number, court, judgment_date, snippet. Cytuj te citations w odpowiedzi koncowej.
 
 ## Iteracja po bledach
