@@ -13,7 +13,11 @@ services:
     networks:
       - cf_mcp_saos
     read_only: true
-    user: "65534:65534"
+    user: "1026:100"
+    environment:
+      - MS_CACHE_DB=/data/ms-discovered.sqlite
+    volumes:
+      - /volume2/docker/mcp-orzeczenia-ms-state:/data:rw
     tmpfs:
       - /tmp:size=32m
     security_opt:
