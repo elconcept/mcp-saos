@@ -35,7 +35,7 @@ export interface SearchParams {
   pageNumber?: number;
 }
 
-export type Source = "local_dump" | "saos_api" | "saos_api_fallback";
+export type Source = "local_dump" | "saos_api" | "saos_api_fallback" | "saos_api_verified_empty";
 
 export interface EngineResult {
   data: unknown;
@@ -148,6 +148,34 @@ function warn(msg: string) {
   process.stderr.write(`[mcp-saos ${new Date().toISOString()}] ${msg}\n`);
 }
 
+/**
+ * A local miss in a partial mirror is not a "not found" verdict. The live SAOS
+ * cross-check must finish successfully, or its failure must propagate as an
+ * upstream error. Injectable lookup keeps all three paths testable offline.
+ */
+export async function crossCheckLocalMiss(
+  p: SearchParams,
+  tool: string,
+  recordDiscrepancy: (total: number, ids: number[]) => void,
+  lookup: (params: SearchParams) => Promise<unknown> = saosSearch,
+): Promise<EngineResult> {
+  const up = (await lookup(p)) as { items?: Array<{ id?: number }>; info?: { totalResults?: number } };
+  if (!up || !Array.isArray(up.items) || !up.info ||
+      !Number.isInteger(up.info.totalResults) || up.info.totalResults! < 0) {
+    throw new Error("Invalid SAOS API search response: missing items or totalResults");
+  }
+  const total = up.info.totalResults!;
+  const ids = up.items.map((it) => it.id).filter((id): id is number => typeof id === "number");
+  if (total > 0 || ids.length > 0) {
+    recordDiscrepancy(total, ids);
+    warn(`DISCREPANCY ${tool}: local 0, SAOS ${total} (params_hash=${hashParams(p)})`);
+    // total>0 with empty items can be an out-of-range page: return upstream
+    // pagination, not a misleading empty local response.
+    return { data: up, source: "saos_api_fallback" };
+  }
+  return { data: up, source: "saos_api_verified_empty" };
+}
+
 export async function searchJudgments(p: SearchParams, tool: string): Promise<EngineResult> {
   const s = localStore();
   if (!s || !s.isReady()) return { data: await saosSearch(p), source: "saos_api" };
@@ -155,20 +183,10 @@ export async function searchJudgments(p: SearchParams, tool: string): Promise<En
   const local = localSearch(s, p);
   if (local.info.totalResults > 0) return { data: local, source: "local_dump" };
 
-  try {
-    const up = (await saosSearch(p)) as { items?: Array<{ id?: number }>; info?: { totalResults?: number } };
-    const ids = (up.items ?? []).map((it) => it.id).filter((x): x is number => typeof x === "number");
-    if (ids.length > 0) {
-      const total = up.info?.totalResults ?? ids.length;
-      s.logDiscrepancy(tool, p, total, ids);
-      // F-04: stderr carries only the params hash, never raw query content.
-      warn(`DISCREPANCY ${tool}: local 0, SAOS ${total} (params_hash=${hashParams(p)})`);
-      return { data: up, source: "saos_api_fallback" };
-    }
-  } catch (err) {
-    warn(`cross-check ${tool} failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return { data: local, source: "local_dump" };
+  return crossCheckLocalMiss(
+    p, tool,
+    (total, ids) => s.logDiscrepancy(tool, p, total, ids),
+  );
 }
 
 /**
