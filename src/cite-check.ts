@@ -295,6 +295,7 @@ export type Verdict =
   | "przelamanie_wykryte"
   | "uchwala_skladu_powiekszonego"
   | "nadal_cytowany"
+  | "nieustalone"
   | "brak_cytowan_w_saos";
 
 /**
@@ -355,7 +356,13 @@ export function computeVerdict(
   hits: ReadonlyArray<{ severity: Severity | string }>
 ): Verdict {
   if (hits.some((h) => h.severity === "strong")) return "przelamanie_wykryte";
-  if (hits.some((h) => h.severity === "caution")) return "uchwala_skladu_powiekszonego";
+  // CIT-03: a caution/unknown signal alone is NOT evidence of a broken
+  // case-law line (it may merely describe the examined resolution itself or
+  // list other resolutions without assessing them). Report neutral instead of
+  // escalating to the alarmist enlarged-panel verdict. The legacy
+  // "uchwala_skladu_powiekszonego" value stays in the union so previously
+  // stored results remain interpretable, but it is no longer auto-emitted.
+  if (hits.some((h) => h.severity === "caution")) return "nieustalone";
   if (totalCiting > 0) return "nadal_cytowany";
   return "brak_cytowan_w_saos";
 }
@@ -371,6 +378,11 @@ export const VERDICT_TEXT: Record<Verdict, string> = {
   nadal_cytowany:
     "NADAL CYTOWANY - pozniejsze orzeczenia przywoluja te sygnature, nie wykryto fraz " +
     "przelamania w jej sasiedztwie. To heurystyka, nie gwarancja aktualnosci.",
+  nieustalone:
+    "NIEUSTALONE - brak rozstrzygajacych danych: nie wykryto fraz przesadzajacych " +
+    "o przelamaniu linii, ale tez nie potwierdzono aktualnosci. Sygnaly ostroznosci " +
+    "(uchwala skladu powiekszonego, zagadnienie prawne) wymagaja recznej weryfikacji " +
+    "pelnych tekstow trafien PRZED powolaniem sie na orzeczenie.",
   brak_cytowan_w_saos:
     "BRAK CYTOWAN W SAOS - nie znaleziono pozniejszych orzeczen przywolujacych te " +
     "sygnature w bazie SAOS. To NIE potwierdza aktualnosci - baza nie obejmuje " +

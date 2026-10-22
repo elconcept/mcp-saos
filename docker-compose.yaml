@@ -13,6 +13,9 @@ services:
       - TZ=Europe/Warsaw
       - SAOS_SYNC_AT=03:30
       - SAOS_SYNC_CONCURRENCY=3
+      # Full /status diagnostics need Authorization: Bearer <token>;
+      # without it the endpoint serves counts only (?token= is NOT accepted).
+      # - STATUS_TOKEN=change-me-in-portainer
     volumes:
       - /volume2/docker/mcp-saos/data:/data
     ports:

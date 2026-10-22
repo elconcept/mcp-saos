@@ -17,7 +17,7 @@ The repo is run by [MateMatic Solutions](https://matematicsolutions.com). The co
 - **Every tool call MUST return `structuredContent.citations`** with: judgment title, canonical URL (SAOS), court, date, case number. This is the product contract.
 - **No caching of client data** - the connector does not log queries. Fork elconcept (1.3.0+): judgments are served from a local mirror of the public SAOS dump (`src/sync.ts`, `src/store.ts`, `src/engine.ts`); only queries whose local answer was empty while the SAOS API had results are recorded (table `discrepancies`) - that is a mirror integrity check, not query logging. Since 1.4.0 the public diagnostics (`GET /status`, stderr) carry only SHA-256 hashes and counters, never raw query text or upstream ids.
 - **No content modification** - we return exactly what the SAOS API returns, with no "enhancement" / summarization. Modification = loss of evidentiary value. (`get_judgment` slices the verbatim text into `offset`/`limit` chunks - slicing positions, never wording.)
-- **Citator honesty (1.4.0+)** - `saos_cite_check` reports `status: complete|partial` with unexamined counts; a self-description of the examined judgment as an enlarged-panel resolution is dropped, not verdict evidence; every hit carries `attitude` (mentioned/followed/distinguished/criticized/potentially_overruled/unknown).
+- **Citator honesty (1.5.0+)** - `saos_cite_check` reports `status: complete|partial` with unexamined counts plus `candidateCoverage`/`fullTextCoverage`/`analysisMode` (`snippets_only` = preliminary review, never a complete analysis); a self-description of the examined judgment as an enlarged-panel resolution is dropped, not verdict evidence; a lone caution signal yields neutral `nieustalone`, never an automatic alarm; empty citing page with positive total = `page_out_of_range`; unknown signature + zero hits = `nieustalone`; every hit carries `attitude` (mentioned/followed/distinguished/criticized/potentially_overruled/unknown).
 
 ## MCP tools (tools contract)
 
@@ -85,6 +85,6 @@ Citation: *MateMatic Solutions (2026), mcp-saos - MCP server for Polish SAOS cas
 `/volume2/docker/mcp-saos` = this repo. Portainer stack `mcp-saos` built from `docker-compose.yaml`; network
 `cf_mcp_saos` (cloudflared + this container), no host ports, public only as https://mcp-saos.xlap.pl/mcp behind
 Cloudflare Access (Managed OAuth). Data: `./data/saos.sqlite` (git-ignored). Push to `main` -> GitHub Actions ->
-deploy-hook rebuilds the stack. Mirror state: `GET /status` (redacted since
-1.4.0: hashes/counters + `buildVersion`, `gitCommit`, `dataSource`,
-`lastSync`, `indexStatus`; gate with `STATUS_TOKEN` -> `Authorization: Bearer`).
+deploy-hook rebuilds the stack. Mirror state: `GET /status` (counts public; per-query detail needs
+`STATUS_TOKEN` -> `Authorization: Bearer`, never `?token=`; plus `buildVersion`, `gitCommit`, `dataSource`,
+`lastSync`, `indexStatus`). After upgrading from <=1.4.0 run `node dist/sync.js --recheck` once.

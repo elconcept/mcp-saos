@@ -3,6 +3,68 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-10-14
+
+Odbior warunkowy memo 1.4.0 (2026-10-14): naprawa falszywych werdyktow
+citatora, fallbacku przy niepelnym mirrorze i integralnosci synchronizacji.
+4 narzedzia i parametry wejsciowe BEZ ZMIAN (backward-compatible na wejsciach);
+nowe wartosci w outputach sa addytywne (pola, werdykt `nieustalone`).
+
+### Fixed (P0)
+
+- CIT-01: `analysisComplete=true` przy `scannedFullText=0` (snippets-only
+  udawal pelna analize). Nowe pokrycie: `candidateCoverage`, `fullTextCoverage`,
+  `analysisMode` (snippets_only / sampled_full_text / exhaustive_full_text);
+  `analysisComplete` wymaga zaladowania wszystkich kandydatow I odczytania
+  wszystkich pelnych tekstow w zakresie; `deepScan=false` z cytowaniami to
+  zawsze PRZEGLAD WSTEPNY (status partial).
+- CIT-02: pusta strona citatora przy dodatnim globalnym total zwraca blad
+  `page_out_of_range` z poprawnym zakresem stron zamiast falszywego
+  `brak_cytowan_w_saos`; zadnych globalnych werdyktow z pustej strony.
+- CIT-03: sygnal `caution`/`unknown` nie eskaluje automatycznie do
+  `uchwala_skladu_powiekszonego` - sam daje neutralne `nieustalone` z trafieniami
+  do recznej weryfikacji. Wartosc legacy zostaje w unii werdyktow (stare wyniki
+  interpretowalne), ale nie jest juz auto-emitowana. Opis celu jako uchwaly
+  skladu powiekszonego nadal odfiltrowany przez `isSelfDescription`.
+- CIT-04: nieznana sygnatura + 0 trafien (np. literowka) daje `nieustalone`
+  z wyjasnieniem (tozsamosc niezweryfikowana), nigdy `brak_cytowan_w_saos`;
+  tekst nie pisze o "pozniejszych orzeczeniach" bez znanej daty badanego.
+- F-02: `searchJudgments` nie ufa slepo niepustemu wynikowi lokalnemu.
+  `probeMirrorGap` wpięty w sciezke: gdy `mirrorIntegrity()!=complete`,
+  total lokalny jest konfrontowany z API SAOS; luka (lokalnie 2 vs SAOS 5)
+  daje adnotacje `mirror_gap` w tekscie i structuredContent + wpis
+  discrepancies; niedostepny upstream przy niezweryfikowanym mirrorze daje
+  flage `mirror_uncertain` zamiast autorytatywnej liczby.
+- F-03: okna `failed`/`degraded`/legacy (pre-status) sa ponawiane
+  (resume pelnego syncu, naprawa w incremental, flaga `--recheck` do taniej
+  weryfikacji bez pobierania); `initial_complete=1` tylko gdy WSZYSTKIE okna
+  `verified` (bramka `completionGate`); diagnostyka niesie `windows_legacy`
+  oraz jawna kolejke naprawy `degraded_windows` (zakresy).
+
+### Changed (P1/P2)
+
+- F-04: token `/status` TYLKO w naglowku `Authorization: Bearer` (wsparcie
+  `?token=` USUNIETE - sekrety nie wedruja w URL/logach); bez tokenu endpoint
+  serwuje wylacznie publiczny podzbior licznikow (bez `recent_discrepancies`),
+  pelna diagnostyka wymaga Bearer. `/healthz` bez zmian (sonda bez danych).
+- F-10: udokumentowana i pokryta testem separacja pol: `legalBase` szuka
+  w `legalBases` orzeczenia, `referencedRegulation` w `referencedRegulations`
+  (cytowany akt != podstawa prawna - 1 vs 0 trafien to poprawna separacja).
+- F-11: liczby w wyjasnieniu skladni ("6"/"127") oznaczone jako PRZYKLAD
+  ilustracyjny, nie wyniki zapytania; CI matrix Node [20, 22, 24] (Docker: 24),
+  `engines >=20`; `server.json` 1.5.0; restart/update/migracja - patrz README.
+- Synchronizacja: nowy tryb `node dist/sync.js --recheck` (tania weryfikacja
+  okien bez pobierania; po wdrozeniu uruchomic RAZ na produkcji, zeby
+  pre-status okna `retry_pending` uczciwie awansowaly do verified/degraded).
+
+### Tests
+
+- 72 testy offline (`npm test`: drift + descriptors + unit), w tym repro
+  CIT-01/02/03/04, F-02 (luka 2 vs 5), F-03 (legacy/degraded/gate), F-04
+  (redakcja/status tiers), F-10 (separacja pol), F-11 (przyklad).
+- UWAGA: pelny odbior wymaga jeszcze testow zywych (Lex Portal -> SAOS)
+  po wdrozeniu oraz potwierdzenia SHA obrazu - patrz PR.
+
 ## [1.4.0] - 2026-10-14
 
 Audyt funkcjonalny, regresyjny i architektoniczny (memo 2026-10-13, ustalenia

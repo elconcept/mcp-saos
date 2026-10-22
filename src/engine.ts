@@ -181,7 +181,48 @@ export async function searchJudgments(p: SearchParams, tool: string): Promise<En
   if (!s || !s.isReady()) return { data: await saosSearch(p), source: "saos_api" };
 
   const local = localSearch(s, p);
-  if (local.info.totalResults > 0) return { data: local, source: "local_dump" };
+  if (local.info.totalResults > 0) {
+    // F-02: a non-empty local answer is NOT automatically complete. When the
+    // mirror itself reports anything but verified completeness, cross-check
+    // the total against the SAOS API and signal the gap instead of claiming
+    // the local count is the whole truth.
+    const integrity = s.mirrorIntegrity();
+    if (integrity.status !== "complete") {
+      const probe = await probeMirrorGap(s, p, local.info.totalResults);
+      if (probe.partial && probe.upstreamTotal !== null) {
+        s.logDiscrepancy(tool, p, probe.upstreamTotal, probe.sampleIds);
+        // F-04: stderr carries only the params hash, never raw query content.
+        warn(`DISCREPANCY ${tool}: local ${local.info.totalResults}, SAOS ${probe.upstreamTotal} (params_hash=${hashParams(p)})`);
+        return {
+          data: {
+            ...local,
+            mirror_gap: {
+              local_total: local.info.totalResults,
+              upstream_total: probe.upstreamTotal,
+              gap: probe.gap,
+              integrity: integrity.status,
+              detail: integrity.detail,
+            },
+          },
+          source: "local_dump",
+        };
+      }
+      if (probe.upstreamTotal === null) {
+        // Upstream unreachable while the mirror is unverified: the local
+        // answer stands, but flagged as uncertain - never as authoritative.
+        return {
+          data: {
+            ...local,
+            mirror_uncertain: true,
+            mirror_integrity: integrity.status,
+            mirror_detail: integrity.detail,
+          },
+          source: "local_dump",
+        };
+      }
+    }
+    return { data: local, source: "local_dump" };
+  }
 
   return crossCheckLocalMiss(
     p, tool,
@@ -190,27 +231,46 @@ export async function searchJudgments(p: SearchParams, tool: string): Promise<En
 }
 
 /**
+ * F-02: pure gap arithmetic (exported for tests). Per-query totals can be
+ * tiny (memo: local 2 vs upstream 5 must flag), so the tolerance is tighter
+ * than the window-sync one: an absolute floor of 2 plus 5% relative.
+ * A negative gap (local ahead via incremental corrections) is never partial.
+ */
+export function gapAssessment(
+  localTotal: number,
+  upstreamTotal: number | null,
+): { gap: number | null; partial: boolean } {
+  if (upstreamTotal === null) return { gap: null, partial: false };
+  const gap = upstreamTotal - localTotal;
+  const tolerance = Math.max(2, upstreamTotal * 0.05);
+  return { gap, partial: gap > tolerance };
+}
+
+/**
  * F-02: completeness probe for a non-empty-but-partial mirror. Compares the
  * local total against the SAOS API total for the same params WITHOUT
  * returning upstream data (audit only). Returns the gap so callers and tests
- * can detect a mirror that answers but under-reports.
+ * can detect a mirror that answers but under-reports. A null upstreamTotal
+ * means the API was unreachable - the caller must flag uncertainty instead
+ * of presenting the local total as authoritative.
  */
 export async function probeMirrorGap(
   s: Store,
   p: SearchParams,
   localTotal: number,
-): Promise<{ upstreamTotal: number | null; gap: number | null; partial: boolean }> {
+): Promise<{ upstreamTotal: number | null; gap: number | null; partial: boolean; sampleIds: number[] }> {
+  void s;
   try {
     const up = (await saosSearch({ ...p, pageSize: 10, pageNumber: 0 })) as {
+      items?: Array<{ id?: number }>;
       info?: { totalResults?: number };
     };
     const upstreamTotal = up.info?.totalResults ?? null;
-    if (upstreamTotal === null) return { upstreamTotal: null, gap: null, partial: false };
-    const gap = upstreamTotal - localTotal;
-    const tolerance = Math.max(10, upstreamTotal * 0.005);
-    return { upstreamTotal, gap, partial: gap > tolerance };
+    const sampleIds = (up.items ?? []).map((it) => it.id).filter((x): x is number => typeof x === "number");
+    const { gap, partial } = gapAssessment(localTotal, upstreamTotal);
+    return { upstreamTotal, gap, partial, sampleIds };
   } catch {
-    return { upstreamTotal: null, gap: null, partial: false };
+    return { upstreamTotal: null, gap: null, partial: false, sampleIds: [] };
   }
 }
 

@@ -209,11 +209,11 @@ test("verdict: strong hit wins", () => {
   assert.equal(v, "przelamanie_wykryte");
 });
 
-test("verdict: caution only", () => {
+test("verdict: caution only is neutral (CIT-03, no auto-escalation)", () => {
   const v = computeVerdict(5, [
     { label: "x", severity: "caution", phrase: "", fragment: "", index: 0 },
   ]);
-  assert.equal(v, "uchwala_skladu_powiekszonego");
+  assert.equal(v, "nieustalone");
 });
 
 test("verdict: citations without signals", () => {
