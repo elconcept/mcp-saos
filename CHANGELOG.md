@@ -3,6 +3,30 @@
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-10-23
+
+**Backward-compatible** (MINOR): nowe narzedzie `show_sources`; istniejace 4
+narzedzia bez zmian kontraktu.
+
+### Added
+
+- `show_sources(ids?, cited_ids?)`: interaktywny widget z orzeczeniami (MCP Apps,
+  zasob `ui://saos/judgments`, mimeType `text/html;profile=mcp-app`): filtr,
+  sortowanie, typ sadu, link do saos.org.pl, kopiowanie sygnatury; `cited_ids`
+  przypiete na gorze. Odpowiednik `Show_Sources` z IURA. Klient bez MCP Apps
+  dostaje te sama liste w `content[]`; dane w `structuredContent.citations`
+  (+ `cited`), `not_found_ids`, `source`.
+- Pamiec tury (`src/turnstate.ts`): `search`, `search_by_case`, `get_judgment`
+  i `saos_cite_check` zapamietuja w RAM wylacznie publiczne metadane
+  orzeczen (citations), pod kluczem rozmowcy, z TTL (`SAOS_STATE_TTL_S`,
+  domyslnie 900 s, max 100 pozycji). `show_sources` bez parametrow wyswietla
+  je i czysci pamiec. Klucz: `mcp-session-id`, tozsamosc Cloudflare Access
+  lub `Authorization` (haszowane SHA-256); bez tozsamosci pamiec jest
+  wylaczona, chyba ze `SAOS_STATE_SHARED=1` (instalacja jednoosobowa). Nic nie
+  trafia na dysk ani do logow; tresci zapytan nie sa przechowywane.
+- Capability `resources` (list/read zasobu widgetu), `_meta.ui.resourceUri` w
+  deskryptorze narzedzia.
+
 ## [1.5.0] - 2026-10-14
 
 Odbior warunkowy memo 1.4.0 (2026-10-14): naprawa falszywych werdyktow

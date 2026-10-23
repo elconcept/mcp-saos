@@ -45,6 +45,7 @@ Administrative courts (WSA/NSA) - no data in SAOS.
 | `get_judgment` | Judgment by ID from SAOS - metadata + text in chunks (`offset`/`limit`, default first 2000 chars; `hasMore`/`nextOffset` chain to the full text) |
 | `search_by_case` | Shortcut: search by case number (e.g. "I ACa 772/13") |
 | `saos_cite_check` | Citator: is the judgment still good law? Finds later citing judgments and scans them for overruling language near the signature |
+| `show_sources` | Interactive widget (MCP Apps, `ui://saos/judgments`): lists the judgments found in the current turn (kept in RAM per caller, `SAOS_STATE_TTL_S`, default 900 s; `SAOS_STATE_SHARED=1` for single-user setups without caller identity) or given as `ids`; `cited_ids` are pinned on top. Plain-text list for clients without MCP Apps |
 
 ### saos_cite_check - the citator
 

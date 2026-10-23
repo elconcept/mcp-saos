@@ -1,6 +1,6 @@
 {
-  "package_version": "1.5.0",
-  "toolset_sha256": "bbca3d7d2c636448a4204dff2a69a2b23638e34ae73570e71f62b813fe8aad9b",
+  "package_version": "1.6.0",
+  "toolset_sha256": "209d3520717fc2105cb47856fc306b32b4f46f18920b4aa5ebe81380867f5019",
   "tools": {
     "get_judgment": {
       "sha256": "eb8852ed025d90624d28eebb037c4a628bfa1b6360574da1bdd73df31705ea50",
@@ -182,6 +182,53 @@
           "type": "object"
         },
         "name": "search_by_case"
+      }
+    },
+    "show_sources": {
+      "sha256": "053379d41013850effca008a07d707ef75f58ff1e08e54e5995a938cd4eb6a61",
+      "descriptor": {
+        "_meta": {
+          "ui": {
+            "resourceUri": "ui://saos/judgments"
+          },
+          "ui/resourceUri": "ui://saos/judgments"
+        },
+        "annotations": {
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false,
+          "readOnlyHint": true
+        },
+        "description": "Wyswietla interaktywny panel (widget) z orzeczeniami SAOS: filtr, sortowanie, typ sadu, link do saos.org.pl. Wywolaj RAZ, po napisaniu pelnej odpowiedzi. Bez parametrow pokazuje orzeczenia znalezione w tej turze przez 'search' / 'search_by_case' / 'get_judgment' / 'saos_cite_check' (serwer je pamieta ok. 15 min i po wyswietleniu czysci). `cited_ids` = ID (saos_id) zacytowane w odpowiedzi, w kolejnosci cytowania (przypiete na gorze). `ids` = jawna lista ID, gdy pamiec jest pusta lub wylaczona. Klient bez obslugi MCP Apps dostaje te sama liste jako tekst. Nie modyfikuje tresci orzeczen. Bledy: `missing_arg` (brak ids i pusta pamiec tury), `invalid_arg` (ID nie-numeryczne lub wiecej niz 50), `not_found` (zadne ID nie istnieje w SAOS), `upstream_error`.",
+        "inputSchema": {
+          "properties": {
+            "cited_ids": {
+              "description": "Opcjonalnie: ID zacytowane w odpowiedzi, w kolejnosci cytowania; przypiete na gorze.",
+              "items": {
+                "type": [
+                  "string",
+                  "number"
+                ]
+              },
+              "maxItems": 50,
+              "type": "array"
+            },
+            "ids": {
+              "description": "Opcjonalnie: numeryczne ID orzeczen SAOS do wyswietlenia (max 50), np. [352475, 31345]. Domyslnie: orzeczenia z biezacej tury.",
+              "items": {
+                "type": [
+                  "string",
+                  "number"
+                ]
+              },
+              "maxItems": 50,
+              "type": "array"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "show_sources"
       }
     }
   }

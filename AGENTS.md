@@ -27,6 +27,7 @@ The repo is run by [MateMatic Solutions](https://matematicsolutions.com). The co
 | `get_judgment` | `id` (required), `offset?`, `limit?` (max 20000, default 2000) | metadata + text chunk + chunk descriptors (`totalLength`, `hasMore`, `nextOffset`) + citations |
 | `search_by_case` | `caseNumber` (required) | all judgments for a given case number |
 | `saos_cite_check` | `caseNumber` (required), `courtType?`, `maxScan?`, `deepScan?`, `pageNumber?` | verdict + coverage (`totalCandidates`/`unexaminedCandidates`/`status`) + hits with attitude + citations |
+| `show_sources` | `ids?` (max 50), `cited_ids?` | MCP Apps widget `ui://saos/judgments` (descriptor `_meta.ui.resourceUri`) + text list; default = judgments remembered from this turn (`src/turnstate.ts`, RAM only, public metadata, TTL); `structuredContent.citations` (+ `cited`), `not_found_ids` |
 
 Full schema description: `src/index.ts` + MCP documentation in `README.md`.
 

@@ -575,7 +575,7 @@ function startServer() {
   return { rpc, stop };
 }
 
-test("AC11: four tools stay registered; get_judgment gains offset/limit only", async () => {
+test("AC11: original four tools stay registered (+ show_sources); get_judgment gains offset/limit only", async () => {
   const { rpc, stop } = startServer();
   try {
     await rpc("initialize", {
@@ -585,7 +585,7 @@ test("AC11: four tools stay registered; get_judgment gains offset/limit only", a
     });
     const { tools } = await rpc("tools/list", {});
     const names = tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["get_judgment", "saos_cite_check", "search", "search_by_case"]);
+    assert.deepEqual(names, ["get_judgment", "saos_cite_check", "search", "search_by_case", "show_sources"]);
     const gj = tools.find((t) => t.name === "get_judgment");
     assert.ok(gj.inputSchema.properties.id, "id still required");
     assert.ok(gj.inputSchema.properties.offset, "offset added");
@@ -593,6 +593,33 @@ test("AC11: four tools stay registered; get_judgment gains offset/limit only", a
     assert.deepEqual(gj.inputSchema.required, ["id"]);
     const cite = tools.find((t) => t.name === "saos_cite_check");
     assert.ok(cite.inputSchema.properties.pageNumber, "citator pageNumber added");
+  } finally {
+    stop();
+  }
+});
+
+test("AC12: show_sources exposes the widget (descriptor _meta, resources/read) and validates args offline", async () => {
+  const { rpc, stop } = startServer();
+  try {
+    await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "acceptance", version: "1" } });
+    const { tools } = await rpc("tools/list", {});
+    const ss = tools.find((t) => t.name === "show_sources");
+    assert.equal(ss._meta.ui.resourceUri, "ui://saos/judgments");
+    assert.deepEqual(ss.inputSchema.required, []);
+    const { resources } = await rpc("resources/list", {});
+    assert.equal(resources[0].uri, "ui://saos/judgments");
+    assert.equal(resources[0].mimeType, "text/html;profile=mcp-app");
+    const { contents } = await rpc("resources/read", { uri: "ui://saos/judgments" });
+    assert.match(contents[0].text, /<!doctype html>/i);
+    assert.match(contents[0].text, /ui\/initialize/);
+    assert.doesNotMatch(contents[0].text, /innerHTML/);
+    const empty = await rpc("tools/call", { name: "show_sources", arguments: {} });
+    assert.equal(empty.isError, true);
+    assert.equal(empty.structuredContent.error_code, "missing_arg");
+    const bad = await rpc("tools/call", { name: "show_sources", arguments: { ids: ["abc"] } });
+    assert.equal(bad.structuredContent.error_code, "invalid_arg");
+    const many = await rpc("tools/call", { name: "show_sources", arguments: { ids: Array.from({ length: 51 }, (_, i) => i + 1) } });
+    assert.equal(many.structuredContent.error_code, "invalid_arg");
   } finally {
     stop();
   }

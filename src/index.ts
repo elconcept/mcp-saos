@@ -13,6 +13,9 @@
  *   search_by_case  - shortcut: search by case number (sygnatura akt)
  *   saos_cite_check - citator "is the judgment alive": later citing judgments
  *                     + phrase scan for line-breaking language (see cite-check.ts)
+ *   show_sources    - interactive widget (MCP Apps, ui://saos/judgments) listing the
+ *                     judgments of the current turn (remembered per caller, see
+ *                     turnstate.ts) or chosen by ID; text fallback for other clients
  *
  * Engine (src/engine.ts): queries are answered from a local mirror of the SAOS
  * dump (src/sync.ts keeps it current daily); the SAOS API is the fallback and a
@@ -25,7 +28,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { WIDGET_URI, WIDGET_MIME, WIDGET_HTML } from "./widget.js";
+import { TurnState, callerKeyFromHeaders, turnTtlMs } from "./turnstate.js";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -59,7 +66,8 @@ import {
 
 export const JUDGMENT_CHUNK_DEFAULT = 2000;
 export const JUDGMENT_CHUNK_MAX = 20000;
-const PKG_VERSION = "1.5.0"; // keep in sync with package.json "version"
+export const SHOW_SOURCES_MAX = 50;
+const PKG_VERSION = "1.6.0"; // keep in sync with package.json "version"
 const BUILD_VERSION = process.env.BUILD_VERSION ?? PKG_VERSION;
 const GIT_COMMIT = process.env.GIT_COMMIT ?? "unknown";
 
@@ -340,6 +348,7 @@ interface SaosCitation {
   judgment_type?: string;
   saos_id?: number;
   court_type?: string;
+  cited?: boolean;
 }
 
 function buildSearchCitations(raw: unknown): SaosCitation[] {
@@ -911,6 +920,9 @@ const INSTRUCTIONS = `Ten serwer MCP udostepnia orzeczenia polskich sadow z bazy
 2. \`search\` - szerokie szukanie po tresci, podstawie prawnej, sedzim, dacie, typie sadu. Zwraca paginowane wyniki (default 10/strona, max 100). Fraza w cudzyslowie = scisle sasiadujace slowa; bez cudzyslowu = slowa laczone AND (wiecej wynikow). Strona poza zakresem zwraca totalResults i totalPages - odroznij od braku wynikow (totalResults=0).
 3. \`get_judgment\` - orzeczenie po ID numerycznym z wynikow search. Domyslnie metadata + pierwsze 2000 znakow tresci; parametry offset/limit (max 20000) skladaja caly tekst bez luk (nextOffset/hasMore w structuredContent).
 
+### Panel z orzeczeniami (widget)
+5. \`show_sources\` - po zakonczeniu odpowiedzi wywolaj RAZ. Bez parametrow wyswietla orzeczenia znalezione przez \`search\` / \`search_by_case\` / \`get_judgment\` / \`saos_cite_check\` w tej turze (serwer je zapamietuje, ok. 15 min) i czysci pamiec. \`cited_ids\` = numeryczne ID (\`saos_id\`) zacytowane w odpowiedzi, w kolejnosci cytowania - zostana przypiete na gorze. \`ids\` = jawna lista ID (gdy pamiec jest pusta lub wylaczona). Klient z obsluga MCP Apps wyswietli interaktywna liste (filtr, sortowanie, link do SAOS); pozostali dostana te sama liste jako tekst. Nie wywoluj przed koncem odpowiedzi.
+
 ### Citator - czy wyrok zyje
 4. \`saos_cite_check\` - podaj sygnature, dostaniesz: (a) pozniejsze orzeczenia cytujace ja (pelnotekstowo, stronicowane pageNumber), (b) skan uzasadnien pod frazy przelamania linii orzeczniczej W OKNIE wokol sygnatury, (c) werdykt: \`przelamanie_wykryte\` / \`nadal_cytowany\` / \`nieustalone\` / \`brak_cytowan_w_saos\` (+ legacy \`uchwala_skladu_powiekszonego\` w starych wynikach) + pokrycie: candidateCoverage/fullTextCoverage/analysisMode (snippets_only = PRZEGLAD WSTEPNY, nie pelna analiza)/analysisComplete/status complete-partial (totalCandidates/loadedCandidates/scannedFullText/unexaminedCandidates). Pusta strona przy dodatnim total = blad \`page_out_of_range\`, nie werdykt. Nieznana sygnatura + 0 trafien = \`nieustalone\`, nie brak cytowan. Fraza opisujaca SAMO badane orzeczenie jako uchwale skladu powiekszonego NIE liczy sie jako przelamanie - wymagany jest inny sklad lub zagadnienie prawne. Kazde trafienie ma attitude: mentioned/followed/distinguished/criticized/potentially_overruled/unknown. Uzywaj PRZED zacytowaniem orzeczenia jako aktualnego. Werdykt to heurystyka - przy \`przelamanie_wykryte\` ZAWSZE zweryfikuj pelny tekst trafienia przez \`get_judgment\`. Brak trafien NIE potwierdza aktualnosci (pokrycie SAOS nierowne).
 
@@ -1133,6 +1145,39 @@ const TOOLS = [
       required: ["caseNumber"],
     },
   },
+  {
+    name: "show_sources",
+    annotations: { ...READ_ONLY_ANNOTATIONS, openWorldHint: false },
+    _meta: { ui: { resourceUri: WIDGET_URI }, "ui/resourceUri": WIDGET_URI },
+    description:
+      "Wyswietla interaktywny panel (widget) z orzeczeniami SAOS: filtr, sortowanie, typ sadu, link do " +
+      "saos.org.pl. Wywolaj RAZ, po napisaniu pelnej odpowiedzi. Bez parametrow pokazuje orzeczenia " +
+      "znalezione w tej turze przez 'search' / 'search_by_case' / 'get_judgment' / 'saos_cite_check' " +
+      "(serwer je pamieta ok. 15 min i po wyswietleniu czysci). `cited_ids` = ID (saos_id) zacytowane " +
+      "w odpowiedzi, w kolejnosci cytowania (przypiete na gorze). `ids` = jawna lista ID, gdy pamiec " +
+      "jest pusta lub wylaczona. Klient bez obslugi MCP Apps dostaje te sama liste jako tekst. " +
+      "Nie modyfikuje tresci orzeczen. Bledy: `missing_arg` (brak ids i pusta pamiec tury), " +
+      "`invalid_arg` (ID nie-numeryczne lub wiecej niz 50), `not_found` (zadne ID nie istnieje w SAOS), " +
+      "`upstream_error`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: {
+          type: "array",
+          items: { type: ["string", "number"] },
+          maxItems: 50,
+          description: "Opcjonalnie: numeryczne ID orzeczen SAOS do wyswietlenia (max 50), np. [352475, 31345]. Domyslnie: orzeczenia z biezacej tury.",
+        },
+        cited_ids: {
+          type: "array",
+          items: { type: ["string", "number"] },
+          maxItems: 50,
+          description: "Opcjonalnie: ID zacytowane w odpowiedzi, w kolejnosci cytowania; przypiete na gorze.",
+        },
+      },
+      required: [],
+    },
+  },
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -1224,11 +1269,34 @@ const VALID_COURT_TYPES = new Set([
   "NATIONAL_APPEAL_CHAMBER",
 ]);
 
-function createServer(): Server {
+// Pamiec tury (efekt Show_Sources z IURA) - wspolna dla zadan HTTP w procesie.
+const turnState = new TurnState<SaosCitation>(turnTtlMs());
+
+function createServer(callerKey: string | null = null): Server {
 const server = new Server(
   { name: "mcp-saos", version: PKG_VERSION }, // keep in sync with package.json "version"
-  { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
+  { capabilities: { tools: {}, resources: {} }, instructions: INSTRUCTIONS }
 );
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [
+    {
+      uri: WIDGET_URI,
+      name: "Orzeczenia SAOS (widget)",
+      description: "Interaktywny panel z orzeczeniami dla narzedzia show_sources (MCP Apps).",
+      mimeType: WIDGET_MIME,
+    },
+  ],
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  if (request.params.uri !== WIDGET_URI) {
+    throw new Error(`Unknown resource: ${request.params.uri}`);
+  }
+  return {
+    contents: [{ uri: WIDGET_URI, mimeType: WIDGET_MIME, text: WIDGET_HTML }],
+  };
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS.map((t) => ({
@@ -1236,10 +1304,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     description: t.description,
     inputSchema: t.inputSchema,
     annotations: t.annotations,
+    ..."_meta" in t ? { _meta: t._meta } : {},
   })),
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+const callTool = async (request: { params: { name: string; arguments?: Record<string, unknown> } }) => {
   const { name, arguments: args } = request.params;
   const a = (args ?? {}) as Record<string, unknown>;
 
@@ -1398,6 +1467,93 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "show_sources": {
+        const rawIds: unknown = a.ids ?? [];
+        const rawCited: unknown = a.cited_ids ?? [];
+        if (!Array.isArray(rawIds) || !Array.isArray(rawCited)) {
+          return errorResult("parametry 'ids' i 'cited_ids' musza byc tablicami ID.", "invalid_arg");
+        }
+        if (rawIds.length > SHOW_SOURCES_MAX || rawCited.length > SHOW_SOURCES_MAX) {
+          return errorResult(`maksymalnie ${SHOW_SOURCES_MAX} ID w jednym wywolaniu.`, "invalid_arg");
+        }
+        const parseAll = (list: unknown[]): number[] | null => {
+          const out: number[] = [];
+          for (const v of list) {
+            const p = parseIdArg(v);
+            if (!p.ok) return null;
+            if (!out.includes(p.id)) out.push(p.id);
+          }
+          return out;
+        };
+        const explicit = parseAll(rawIds);
+        const citedIds = parseAll(rawCited);
+        if (!explicit || !citedIds) {
+          return errorResult("kazde ID musi byc dodatnia liczba calkowita.", "invalid_arg");
+        }
+        const remembered = turnState.peek(callerKey);
+        const ids = explicit.length ? explicit : remembered.map((c) => c.saos_id as number);
+        if (ids.length === 0 && citedIds.length === 0) {
+          return errorResult(
+            "brak orzeczen do wyswietlenia: pamiec tury jest pusta albo wylaczona (brak tozsamosci rozmowcy). " +
+              "Najpierw uzyj 'search' / 'search_by_case' / 'get_judgment' albo podaj 'ids'.",
+            "missing_arg"
+          );
+        }
+        // Zacytowane na gorze (w kolejnosci cytowania), reszta w kolejnosci znalezienia.
+        const order = [...citedIds, ...ids.filter((i) => !citedIds.includes(i))];
+        const results = await Promise.all(
+          order.map(async (id) => {
+            const known = turnState.get(callerKey, id);
+            if (known) return { id, citation: known as SaosCitation | null, source: undefined as Source | undefined, err: null as unknown };
+            try {
+              const r = await getJudgment(id, "show_sources");
+              const empty = !r.data || (typeof r.data === "object" && Object.keys(r.data as object).length === 0);
+              return { id, citation: empty ? null : buildJudgmentCitation(r.data), source: r.source as Source | undefined, err: null as unknown };
+            } catch (err) {
+              if (err instanceof HttpError && err.status === 404) {
+                return { id, citation: null, source: undefined, err: null as unknown };
+              }
+              return { id, citation: null, source: undefined, err };
+            }
+          })
+        );
+        const failed = results.find((r) => r.err);
+        if (failed && results.every((r) => !r.citation)) {
+          return upstreamErrorResult(failed.err, "Sprobuj ponownie.");
+        }
+        const citations: SaosCitation[] = [];
+        const notFound: number[] = [];
+        const sources = new Set<Source>();
+        for (const r of results) {
+          if (!r.citation) {
+            notFound.push(r.id);
+            continue;
+          }
+          if (r.source) sources.add(r.source);
+          const { cited: _drop, ...base } = r.citation;
+          citations.push(citedIds.includes(r.id) ? { ...base, cited: true } : base);
+        }
+        if (citations.length === 0) {
+          return errorResult(
+            `Zadne z podanych ID nie istnieje w SAOS (${notFound.join(", ")}). Sprawdz ID przez 'search' / 'search_by_case'.`,
+            "not_found"
+          );
+        }
+        turnState.clear(callerKey);
+        const lines = [`Panel orzeczen SAOS: ${citations.length} poz.${citedIds.length ? ` (zacytowane: ${citations.filter((c) => c.cited).length})` : ""}.`];
+        citations.forEach((c, i) => {
+          lines.push(
+            `${i + 1}. ${c.case_number ?? c.title}${c.cited ? " [zacytowane]" : ""} | ${c.court ?? "?"} | ${c.judgment_date ?? "?"} | ${c.url}`
+          );
+        });
+        if (notFound.length) lines.push("", `Nie znaleziono w SAOS (ID): ${notFound.join(", ")}.`);
+        const source = sources.size ? combineSources(sources) : "local_dump";
+        return {
+          content: [{ type: "text" as const, text: withSourceNote(lines.join("\n"), source) }],
+          structuredContent: { citations, not_found_ids: notFound, source },
+        };
+      }
+
       case "saos_cite_check": {
         if (!a.caseNumber) {
           return errorResult("parametr 'caseNumber' jest wymagany.", "missing_arg");
@@ -1415,6 +1571,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (err: unknown) {
     return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
   }
+};
+
+// Zapamietuje citations z wynikow wyszukiwania/odczytu (nie z bledow i nie z show_sources).
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const res = await callTool(request);
+  if (request.params.name !== "show_sources" && !("isError" in res && res.isError)) {
+    const sc = (res as { structuredContent?: { citations?: unknown } }).structuredContent;
+    if (sc && Array.isArray(sc.citations)) turnState.record(callerKey, sc.citations as SaosCitation[]);
+  }
+  return res;
 });
 
 return server;
@@ -1545,7 +1711,7 @@ async function startHttp(): Promise<void> {
       sendJson(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }, { Allow: "POST" });
       return;
     }
-    const server = createServer();
+    const server = createServer(callerKeyFromHeaders(req.headers));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       transport.close();
@@ -1572,7 +1738,7 @@ async function main() {
     await startHttp();
   } else {
     const transport = new StdioServerTransport();
-    await createServer().connect(transport);
+    await createServer("stdio").connect(transport);
     // Log to stderr only - stdout is reserved for MCP JSON-RPC protocol
     process.stderr.write("mcp-saos server started (stdio transport)\n");
   }
