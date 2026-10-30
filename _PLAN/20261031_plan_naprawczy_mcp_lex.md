@@ -17,7 +17,7 @@
 1. **P0 — MCP `content`:** test na `get_judgment(166511, offset=0, limit=450)` na kontenerze, Cloudflare i `lex`; zachować dosłowny tekst chunku bez konwersji do samego `citations`. Sprawdzić `nextOffset` i kompletność 7686 znaków przy iteracji.
 2. **P0 — cytator:** przy `snippets_only` zawsze dodać jednoznacznie `weryfikacja wstępna — brak analizy pełnych tekstów`; nie używać sformułowań sugerujących pełną weryfikację. Rozróżnić wyczerpanie zbioru kandydatów i realne sprawdzenie orzeczeń w pełnym tekście. Werdykt o braku cytowań tylko w granicach jawnego pokrycia SAOS.
 3. **P1 — walidacja:** wszystkie argumenty `pageSize<10`, `pageNumber<0`, `offset<0`, błędne `id`, `limit>20000`: kontrolowany, polski kod błędu z wymaganym zakresem, bez cichej normalizacji jeśli kontrakt wymaga odrzucenia.
-4. **P1 — mirror:** raport aktualności i pokrycia `local_dump` vs SAOS API, kategorie niepełności i niezweryfikowane zero wyników; test kontrolny po sygnaturze i frazie, także bez wymaganego IDR analogii — nie mieszać wnioskowania z danych niekompletnych.
+4. **P1 — mirror:** raport aktualności i pokrycia `local_dump` vs SAOS API, kategorie niepełności i niezweryfikowane zero wyników; test kontrolny po sygnaturze i frazie, odrębnie odróżniać brak danych od potwierdzonego braku orzeczenia.
 5. **P2 — regresja:** fixtures cytatora z 0, 1 i wieloma powołaniami, rzeczywistymi referencjami, `deepScan` i `maxScan` oraz dwiema stronami wyników; dostosować opisy i polskie komunikaty.
 
 ## Akceptacja
