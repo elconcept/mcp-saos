@@ -1429,24 +1429,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+
       case "search_by_case": {
         if (!a.caseNumber) {
           return errorResult("parametr 'caseNumber' jest wymagany.", "missing_arg");
+        }
+        let caseNo: string;
+        try {
+          caseNo = normalizeCaseSignature(a.caseNumber).canonical;
+        } catch (err) {
+          if (err instanceof CaseSignatureError) {
+            return errorResult(err.message, err.code, { fault: "caller", retryable: false });
+          }
+          throw err;
         }
         let raw: unknown;
         let source: Source;
         try {
           ({ data: raw, source } = await searchJudgments({
-            caseNumber: a.caseNumber as string,
+            caseNumber: caseNo,
             pageSize: PAGE_SIZE_DEFAULT,
           }, "search_by_case"));
         } catch (err) {
+          // SAOS outage is NOT a verified miss; do not fall through to PrawMi.
           return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
         }
         const { text, pagination } = formatSearchResults(raw, 0, PAGE_SIZE_DEFAULT);
+        if (pagination.totalResults === 0 && process.env.ORZECZENIA_FALLBACK === "1") {
+          try {
+            const found = await lookupPrawMi(caseNo);
+            if (found) return formatPrawMiDocument(found);
+          } catch (err) {
+            // An unavailable third-party source does not invalidate the SAOS
+            // result and must not be called a global not_found.
+            return {
+              content: [{ type: "text", text: withSourceNote(text, source) +
+                "\\nPrawMi: niedostepny/bledny fallback (" +
+                (err instanceof CaseSignatureError ? err.code : "upstream_error") + ")." }],
+              structuredContent: {
+                citations: [], source, pagination, prawmi_status: "upstream_error",
+              },
+            };
+          }
+        }
         return {
-          content: [{ type: "text", text: withSourceNote(text, source) }],
-          structuredContent: { citations: buildSearchCitations(raw), source, pagination },
+          content: [{ type: "text", text: withSourceNote(text, source) +
+            (pagination.totalResults === 0 && process.env.ORZECZENIA_FALLBACK === "1"
+              ? "\\nNie znaleziono takze w PrawMi (potwierdzone HTTP 404)."
+              : "") }],
+          structuredContent: {
+            citations: buildSearchCitations(raw), source, pagination,
+            ...(pagination.totalResults === 0 ? {
+              prawmi_status: process.env.ORZECZENIA_FALLBACK === "1"
+                ? "verified_empty" : "disabled",
+            } : {}),
+          },
         };
       }
 
