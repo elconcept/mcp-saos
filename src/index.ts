@@ -1377,7 +1377,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // F-09: 0/""/missing = missing_arg; "abc"/-5/1.5 = invalid_arg (caller).
         // An ID can also be an exact docket signature. The SAOS lookup still
         // runs first, and a PrawMi read is allowed only after a verified miss.
-        if (typeof a.id === "string" && /[A-Za-z]/.test(a.id) && /\\d/.test(a.id)) {
+        if (typeof a.id === "string" && /[A-Za-z]/.test(a.id) && /\d/.test(a.id)) {
           let canonical: string;
           try {
             canonical = normalizeCaseSignature(a.id).canonical;
@@ -1400,7 +1400,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if ((candidates.info?.totalResults ?? 0) > 1 || hits.length > 1) {
             const formatted = formatSearchResults(candidates, 0, PAGE_SIZE_DEFAULT);
             return {
-              content: [{ type: "text", text: "Sygnatura wystepuje wielokrotnie; wybierz wlasciwe ID SAOS.\\n" + formatted.text }],
+              content: [{ type: "text", text: "Sygnatura wystepuje wielokrotnie; wybierz wlasciwe ID SAOS.\n" + formatted.text }],
               structuredContent: { source: "saos_multiple_courts", citations: buildSearchCitations(candidates),
                 pagination: formatted.pagination, error_code: "ambiguous_signature" },
             };
@@ -1534,7 +1534,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // result and must not be called a global not_found.
             return {
               content: [{ type: "text", text: withSourceNote(text, source) +
-                "\\nPrawMi: niedostepny/bledny fallback (" +
+                "\nPrawMi: niedostepny/bledny fallback (" +
                 (err instanceof CaseSignatureError ? err.code : "upstream_error") + ")." }],
               structuredContent: {
                 citations: [], source, pagination, prawmi_status: "upstream_error",
@@ -1545,7 +1545,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: "text", text: withSourceNote(text, source) +
             (pagination.totalResults === 0 && process.env.ORZECZENIA_FALLBACK === "1"
-              ? "\\nNie znaleziono takze w PrawMi (potwierdzone HTTP 404)."
+              ? "\nNie znaleziono takze w PrawMi (potwierdzone HTTP 404)."
               : "") }],
           structuredContent: {
             citations: buildSearchCitations(raw), source, pagination,
