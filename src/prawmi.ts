@@ -132,7 +132,7 @@ export async function lookupPrawMi(
   const normalized = normalizeCaseSignature(caseNumber);
   const base = process.env.ORZECZENIA_API_URL || "http://mcp-orzeczenia:8000";
   const url = new URL("/v1/judgments/lookup", base);
-  url.searchParams.set("signature", normalized.canonical);
+  url.searchParams.set("signature", caseNumber);
   const response = await fetcher(url.toString(), {
     method: "GET", redirect: "error",
     signal: AbortSignal.timeout(25000),
