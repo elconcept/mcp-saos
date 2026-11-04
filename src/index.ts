@@ -51,6 +51,7 @@ import {
   type Source,
 } from "./engine.js";
 import { isValidIsoDate } from "./store.js";
+import { normalizeCaseSignature, lookupPrawMi, CaseSignatureError, type PrawMiDocument } from "./prawmi.js";
 import {
   classifyHttpError,
   HttpError,
@@ -388,6 +389,57 @@ function buildJudgmentCitation(raw: unknown): SaosCitation | null {
     ...(d.judgmentType && { judgment_type: d.judgmentType }),
     saos_id: d.id,
     ...(d.courtType && { court_type: d.courtType }),
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// PrawMi is a distinct, secondary provenance source; never masquerade as SAOS.
+// Keep source text paginated so long judgments do not flood the model context.
+// ---------------------------------------------------------------------------
+function formatPrawMiDocument(doc: PrawMiDocument, offset = 0, limit = JUDGMENT_CHUNK_DEFAULT) {
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const safeLimit = Math.max(1, Math.min(JUDGMENT_CHUNK_MAX, Math.floor(limit)));
+  const chunk = doc.text.slice(safeOffset, safeOffset + safeLimit);
+  const nextOffset = safeOffset + chunk.length < doc.text.length ? safeOffset + chunk.length : null;
+  const court = doc.court && !["COMMON", "SUPREME"].includes(doc.court) ? doc.court : undefined;
+  const citation = {
+    title: [doc.signature, court].filter(Boolean).join(" - "),
+    url: doc.url,
+    case_number: doc.signature,
+    ...(court && { court }),
+    ...(doc.judgment_date && { judgment_date: doc.judgment_date }),
+    ...(doc.judgment_type && { judgment_type: doc.judgment_type }),
+    snippet: doc.text.slice(0, 200),
+  };
+  const text = [
+    "ZRODLO WTORNE: PrawMi (sygnatury nie znaleziono w SAOS; nie oznacza to nieistnienia oryginalu).",
+    `Sygnatura: ${doc.signature}`,
+    `Typ: ${doc.judgment_type ?? "nieustalony"}`,
+    `Sad: ${court ?? "nieustalony"}`,
+    `Data: ${doc.judgment_date ?? "nieustalona"}`,
+    `URL: ${doc.url}`,
+    `--- Tresc (znaki ${safeOffset}-${safeOffset + chunk.length} z ${doc.text.length}) ---`,
+    chunk,
+    ...(nextOffset !== null ? [
+      `[...]. Nastepny fragment: get_judgment(id="${doc.signature}", offset=${nextOffset}, limit=${safeLimit})`,
+    ] : []),
+    "Ostrzezenie: PrawMi nie jest urzedowym zrodlem. Weryfikuj z oryginalem orzeczenia.",
+  ].join("\n");
+  return {
+    content: [{ type: "text" as const, text }],
+    structuredContent: {
+      source: "prawmi_fallback",
+      citations: [citation],
+      caseNumber: doc.signature,
+      totalLength: doc.text.length,
+      returnedLength: chunk.length,
+      offset: safeOffset,
+      hasMore: nextOffset !== null,
+      nextOffset,
+      truncated: nextOffset !== null,
+      ...(doc.warnings?.length && { warnings: doc.warnings }),
+    },
   };
 }
 
