@@ -1457,7 +1457,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { text, pagination } = formatSearchResults(raw, 0, PAGE_SIZE_DEFAULT);
         if (pagination.totalResults === 0 && process.env.ORZECZENIA_FALLBACK === "1") {
           try {
-            const found = await lookupPrawMi(caseNo);
+            const found = await lookupPrawMi(String(a.caseNumber));
             if (found) return formatPrawMiDocument(found);
           } catch (err) {
             // An unavailable third-party source does not invalidate the SAOS
