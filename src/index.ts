@@ -1375,6 +1375,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_judgment": {
         // F-09: 0/""/missing = missing_arg; "abc"/-5/1.5 = invalid_arg (caller).
+        // An ID can also be an exact docket signature. The SAOS lookup still
+        // runs first, and a PrawMi read is allowed only after a verified miss.
+        if (typeof a.id === "string" && /[A-Za-z]/.test(a.id) && /\\d/.test(a.id)) {
+          let canonical: string;
+          try {
+            canonical = normalizeCaseSignature(a.id).canonical;
+          } catch (err) {
+            if (err instanceof CaseSignatureError) {
+              return errorResult(err.message, err.code, { fault: "caller", retryable: false });
+            }
+            throw err;
+          }
+          let candidates: SearchResponse;
+          try {
+            const resolved = await searchJudgments({
+              caseNumber: canonical, pageSize: PAGE_SIZE_DEFAULT,
+            }, "get_judgment_by_signature");
+            candidates = resolved.data as SearchResponse;
+          } catch (err) {
+            return upstreamErrorResult(err, "Nie mozna potwierdzic braku sygnatury w SAOS.");
+          }
+          const hits = candidates.items ?? [];
+          if ((candidates.info?.totalResults ?? 0) > 1 || hits.length > 1) {
+            const formatted = formatSearchResults(candidates, 0, PAGE_SIZE_DEFAULT);
+            return {
+              content: [{ type: "text", text: "Sygnatura wystepuje wielokrotnie; wybierz wlasciwe ID SAOS.\\n" + formatted.text }],
+              structuredContent: { source: "saos_multiple_courts", citations: buildSearchCitations(candidates),
+                pagination: formatted.pagination, error_code: "ambiguous_signature" },
+            };
+          }
+          if (hits[0]?.id !== undefined) {
+            // A primary-source SAOS judgment takes precedence over PrawMi.
+            try {
+              const { data: doc, source } = await getJudgment(hits[0].id, "get_judgment");
+              const offset = Math.max(0, Math.floor(parseChunkArg(a.offset, 0)));
+              const limit = Math.min(JUDGMENT_CHUNK_MAX,
+                Math.max(1, Math.floor(parseChunkArg(a.limit, JUDGMENT_CHUNK_DEFAULT))));
+              const chunk = formatJudgment(doc, offset, limit);
+              const citation = buildJudgmentCitation(doc);
+              return { content: [{ type: "text", text: withSourceNote(chunk.text, source) }],
+                structuredContent: { source, citations: citation ? [citation] : [],
+                  totalLength: chunk.totalLength, returnedLength: chunk.returnedLength,
+                  offset: chunk.offset, hasMore: chunk.hasMore, nextOffset: chunk.nextOffset,
+                  truncated: chunk.truncated } };
+            } catch (err) {
+              return upstreamErrorResult(err, "Nie udalo sie pobrac tresci SAOS.");
+            }
+          }
+          if (process.env.ORZECZENIA_FALLBACK !== "1") {
+            return errorResult("Nie znaleziono sygnatury w SAOS; fallback PrawMi wylaczony.",
+              "fallback_disabled", { fault: "upstream", retryable: false });
+          }
+          try {
+            const doc = await lookupPrawMi(a.id);
+            if (!doc) {
+              return errorResult("Brak w SAOS i PrawMi; nie oznacza to braku orzeczenia.",
+                "not_found", { fault: "upstream", retryable: false });
+            }
+            return formatPrawMiDocument(
+              doc,
+              parseChunkArg(a.offset, 0),
+              parseChunkArg(a.limit, JUDGMENT_CHUNK_DEFAULT),
+            );
+          } catch (err) {
+            return errorResult(
+              "PrawMi niedostepne: " + (err instanceof CaseSignatureError ? err.code : "upstream_error"),
+              "prawmi_upstream_error", { fault: "upstream", retryable: true },
+            );
+          }
+        }
         const parsed = parseIdArg(a.id);
         if (!parsed.ok) {
           return parsed.empty
