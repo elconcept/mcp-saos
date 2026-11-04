@@ -985,6 +985,8 @@ Tool zwraca \`isError: true\` + tekst z prefixem \`[code]\` + structuredContent 
 - \`upstream_error\` - blad komunikacji z API SAOS (HTTP 5xx, timeout 40s, 429, 401/403 bez retry). fault=upstream/network, retryable per structuredContent, retry_after_s przy 429. Awaria SAOS to NIE pusty wynik. Retry raz przed surface do uzytkownika.
 - \`invalid_court_type\` - klient podal \`ADMINISTRATIVE\` lub inny niedozwolony typ. Dozwolone: COMMON, SUPREME, CONSTITUTIONAL_TRIBUNAL, NATIONAL_APPEAL_CHAMBER.
 
+- PrawMi fallback: invalid_signature (bledna sygnatura), ambiguous_signature (brak pewnego podzialu), signature_mismatch (inna sygnatura/rok), fallback_disabled (integracja nieaktywna), prawmi_upstream_error (awaria komunikacji), prawmi_response_invalid (odpowiedz nie przeszla walidacji). Brak w SAOS nie oznacza braku orzeczenia.
+
 ## Styl odpowiedzi
 
 - Cytuj sygnature w pelnej formie z sadem: "I ACa 772/13 (SA Warszawa, 2013-09-15)".
@@ -1200,7 +1202,13 @@ type ErrorCode =
   | "not_found"
   | "page_out_of_range"
   | "upstream_error"
-  | "invalid_court_type";
+  | "invalid_court_type"
+  | "invalid_signature"
+  | "ambiguous_signature"
+  | "signature_mismatch"
+  | "fallback_disabled"
+  | "prawmi_upstream_error"
+  | "prawmi_response_invalid";
 
 interface ErrorDetails {
   fault?: "caller" | "upstream" | "network";
