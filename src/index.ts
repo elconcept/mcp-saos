@@ -1328,12 +1328,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           Math.max(PAGE_SIZE_MIN, typeof a.pageSize === "number" ? a.pageSize : PAGE_SIZE_DEFAULT)
         );
         const pageNumber = Math.max(0, Math.floor(typeof a.pageNumber === "number" ? a.pageNumber : 0));
+        let exactCaseNumber: string | undefined;
+        if (a.caseNumber !== undefined) {
+          try {
+            exactCaseNumber = normalizeCaseSignature(a.caseNumber).canonical;
+          } catch (err) {
+            if (err instanceof CaseSignatureError) {
+              return errorResult(err.message, err.code, { fault: "caller", retryable: false });
+            }
+            throw err;
+          }
+        }
         let raw: unknown;
         let source: Source;
         try {
           ({ data: raw, source } = await searchJudgments({
             all: a.all as string | undefined,
-            caseNumber: a.caseNumber as string | undefined,
+            caseNumber: exactCaseNumber,
             courtType: a.courtType as string | undefined,
             judgeName: a.judgeName as string | undefined,
             referencedRegulation: a.referencedRegulation as string | undefined,
@@ -1347,6 +1358,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
         }
         const { text, pagination } = formatSearchResults(raw, pageNumber, pageSize);
+        // Only a pure exact-signature search can use the PrawMi adapter.
+        // Other SAOS filters have no equivalent on PrawMi.
+        if (pagination.totalResults === 0 && exactCaseNumber &&
+            !a.all && !a.courtType && !a.judgeName && !a.referencedRegulation &&
+            !a.legalBase && !a.dateFrom && !a.dateTo && pageNumber === 0 &&
+            process.env.ORZECZENIA_FALLBACK === "1") {
+          try {
+            const found = await lookupPrawMi(String(a.caseNumber));
+            if (found) return formatPrawMiDocument(found);
+          } catch (err) {
+            return { content: [{ type: "text",
+                text: withSourceNote(text, source) +
+                  "\\nNie mozna potwierdzic statusu PrawMi: " +
+                  (err instanceof CaseSignatureError ? err.code : "upstream_error") }],
+              structuredContent: {
+                citations: buildSearchCitations(raw), source, pagination,
+                prawmi_status: "upstream_error",
+              } };
+          }
+        }
         // F-08: out-of-range page keeps totalResults visible (structured too).
         if ((raw as SearchResponse).items?.length === 0 && (pagination.totalResults ?? 0) > 0) {
           return {
