@@ -23,9 +23,11 @@ export interface PrawMiDocument {
   warnings?: string[];
 }
 
+export type PrawMiErrorCode = "invalid_signature" | "ambiguous_signature" | "prawmi_upstream_error" | "prawmi_response_invalid" | "signature_mismatch";
+
 export class CaseSignatureError extends Error {
-  readonly code: string;
-  constructor(code: string, message: string) {
+  readonly code: PrawMiErrorCode;
+  constructor(code: PrawMiErrorCode, message: string) {
     super(message);
     this.code = code;
   }
