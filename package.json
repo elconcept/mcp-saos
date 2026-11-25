@@ -10,7 +10,7 @@
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "drift": "node test/drift.mjs",
-    "test:unit": "node --test test/cite-check.test.mjs test/acceptance.test.mjs",
+    "test:unit": "node --test test/cite-check.test.mjs test/acceptance.test.mjs test/prawmi.test.mjs",
     "test": "npm run drift && npm run test:unit",
     "sync": "node dist/sync.js"
   },

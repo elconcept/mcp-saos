@@ -51,6 +51,7 @@ import {
   type Source,
 } from "./engine.js";
 import { isValidIsoDate } from "./store.js";
+import { normalizeCaseSignature, lookupPrawMi, CaseSignatureError, type PrawMiDocument } from "./prawmi.js";
 import {
   classifyHttpError,
   HttpError,
@@ -388,6 +389,57 @@ function buildJudgmentCitation(raw: unknown): SaosCitation | null {
     ...(d.judgmentType && { judgment_type: d.judgmentType }),
     saos_id: d.id,
     ...(d.courtType && { court_type: d.courtType }),
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// PrawMi is a distinct, secondary provenance source; never masquerade as SAOS.
+// Keep source text paginated so long judgments do not flood the model context.
+// ---------------------------------------------------------------------------
+function formatPrawMiDocument(doc: PrawMiDocument, offset = 0, limit = JUDGMENT_CHUNK_DEFAULT) {
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const safeLimit = Math.max(1, Math.min(JUDGMENT_CHUNK_MAX, Math.floor(limit)));
+  const chunk = doc.text.slice(safeOffset, safeOffset + safeLimit);
+  const nextOffset = safeOffset + chunk.length < doc.text.length ? safeOffset + chunk.length : null;
+  const court = doc.court && !["COMMON", "SUPREME"].includes(doc.court) ? doc.court : undefined;
+  const citation = {
+    title: [doc.signature, court].filter(Boolean).join(" - "),
+    url: doc.url,
+    case_number: doc.signature,
+    ...(court && { court }),
+    ...(doc.judgment_date && { judgment_date: doc.judgment_date }),
+    ...(doc.judgment_type && { judgment_type: doc.judgment_type }),
+    snippet: doc.text.slice(0, 200),
+  };
+  const text = [
+    "ZRODLO WTORNE: PrawMi (sygnatury nie znaleziono w SAOS; nie oznacza to nieistnienia oryginalu).",
+    `Sygnatura: ${doc.signature}`,
+    `Typ: ${doc.judgment_type ?? "nieustalony"}`,
+    `Sad: ${court ?? "nieustalony"}`,
+    `Data: ${doc.judgment_date ?? "nieustalona"}`,
+    `URL: ${doc.url}`,
+    `--- Tresc (znaki ${safeOffset}-${safeOffset + chunk.length} z ${doc.text.length}) ---`,
+    chunk,
+    ...(nextOffset !== null ? [
+      `[...]. Nastepny fragment: get_judgment(id="${doc.signature}", offset=${nextOffset}, limit=${safeLimit})`,
+    ] : []),
+    "Ostrzezenie: PrawMi nie jest urzedowym zrodlem. Weryfikuj z oryginalem orzeczenia.",
+  ].join("\n");
+  return {
+    content: [{ type: "text" as const, text }],
+    structuredContent: {
+      source: "prawmi_fallback",
+      citations: [citation],
+      caseNumber: doc.signature,
+      totalLength: doc.text.length,
+      returnedLength: chunk.length,
+      offset: safeOffset,
+      hasMore: nextOffset !== null,
+      nextOffset,
+      truncated: nextOffset !== null,
+      ...(doc.warnings?.length && { warnings: doc.warnings }),
+    },
   };
 }
 
@@ -933,6 +985,8 @@ Tool zwraca \`isError: true\` + tekst z prefixem \`[code]\` + structuredContent 
 - \`upstream_error\` - blad komunikacji z API SAOS (HTTP 5xx, timeout 40s, 429, 401/403 bez retry). fault=upstream/network, retryable per structuredContent, retry_after_s przy 429. Awaria SAOS to NIE pusty wynik. Retry raz przed surface do uzytkownika.
 - \`invalid_court_type\` - klient podal \`ADMINISTRATIVE\` lub inny niedozwolony typ. Dozwolone: COMMON, SUPREME, CONSTITUTIONAL_TRIBUNAL, NATIONAL_APPEAL_CHAMBER.
 
+- PrawMi fallback: invalid_signature (bledna sygnatura), ambiguous_signature (brak pewnego podzialu), signature_mismatch (inna sygnatura/rok), fallback_disabled (integracja nieaktywna), prawmi_upstream_error (awaria komunikacji), prawmi_response_invalid (odpowiedz nie przeszla walidacji). Brak w SAOS nie oznacza braku orzeczenia.
+
 ## Styl odpowiedzi
 
 - Cytuj sygnature w pelnej formie z sadem: "I ACa 772/13 (SA Warszawa, 2013-09-15)".
@@ -1148,7 +1202,13 @@ type ErrorCode =
   | "not_found"
   | "page_out_of_range"
   | "upstream_error"
-  | "invalid_court_type";
+  | "invalid_court_type"
+  | "invalid_signature"
+  | "ambiguous_signature"
+  | "signature_mismatch"
+  | "fallback_disabled"
+  | "prawmi_upstream_error"
+  | "prawmi_response_invalid";
 
 interface ErrorDetails {
   fault?: "caller" | "upstream" | "network";
@@ -1276,12 +1336,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           Math.max(PAGE_SIZE_MIN, typeof a.pageSize === "number" ? a.pageSize : PAGE_SIZE_DEFAULT)
         );
         const pageNumber = Math.max(0, Math.floor(typeof a.pageNumber === "number" ? a.pageNumber : 0));
+        let exactCaseNumber: string | undefined;
+        if (a.caseNumber !== undefined) {
+          try {
+            exactCaseNumber = normalizeCaseSignature(a.caseNumber).canonical;
+          } catch (err) {
+            if (err instanceof CaseSignatureError) {
+              return errorResult(err.message, err.code, { fault: "caller", retryable: false });
+            }
+            throw err;
+          }
+        }
         let raw: unknown;
         let source: Source;
         try {
           ({ data: raw, source } = await searchJudgments({
             all: a.all as string | undefined,
-            caseNumber: a.caseNumber as string | undefined,
+            caseNumber: exactCaseNumber,
             courtType: a.courtType as string | undefined,
             judgeName: a.judgeName as string | undefined,
             referencedRegulation: a.referencedRegulation as string | undefined,
@@ -1295,6 +1366,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
         }
         const { text, pagination } = formatSearchResults(raw, pageNumber, pageSize);
+        // Only a pure exact-signature search can use the PrawMi adapter.
+        // Other SAOS filters have no equivalent on PrawMi.
+        if (pagination.totalResults === 0 && exactCaseNumber &&
+            !a.all && !a.courtType && !a.judgeName && !a.referencedRegulation &&
+            !a.legalBase && !a.dateFrom && !a.dateTo && pageNumber === 0 &&
+            process.env.ORZECZENIA_FALLBACK === "1") {
+          try {
+            const found = await lookupPrawMi(String(a.caseNumber));
+            if (found) return formatPrawMiDocument(found);
+          } catch (err) {
+            return { content: [{ type: "text",
+                text: withSourceNote(text, source) +
+                  "\\nNie mozna potwierdzic statusu PrawMi: " +
+                  (err instanceof CaseSignatureError ? err.code : "upstream_error") }],
+              structuredContent: {
+                citations: buildSearchCitations(raw), source, pagination,
+                prawmi_status: "upstream_error",
+              } };
+          }
+        }
         // F-08: out-of-range page keeps totalResults visible (structured too).
         if ((raw as SearchResponse).items?.length === 0 && (pagination.totalResults ?? 0) > 0) {
           return {
@@ -1323,6 +1414,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_judgment": {
         // F-09: 0/""/missing = missing_arg; "abc"/-5/1.5 = invalid_arg (caller).
+        // An ID can also be an exact docket signature. The SAOS lookup still
+        // runs first, and a PrawMi read is allowed only after a verified miss.
+        if (typeof a.id === "string" && /[A-Za-z]/.test(a.id) && /\d/.test(a.id)) {
+          let canonical: string;
+          try {
+            canonical = normalizeCaseSignature(a.id).canonical;
+          } catch (err) {
+            if (err instanceof CaseSignatureError) {
+              return errorResult(err.message, err.code, { fault: "caller", retryable: false });
+            }
+            throw err;
+          }
+          let candidates: SearchResponse;
+          try {
+            const resolved = await searchJudgments({
+              caseNumber: canonical, pageSize: PAGE_SIZE_DEFAULT,
+            }, "get_judgment_by_signature");
+            candidates = resolved.data as SearchResponse;
+          } catch (err) {
+            return upstreamErrorResult(err, "Nie mozna potwierdzic braku sygnatury w SAOS.");
+          }
+          const hits = candidates.items ?? [];
+          if ((candidates.info?.totalResults ?? 0) > 1 || hits.length > 1) {
+            const formatted = formatSearchResults(candidates, 0, PAGE_SIZE_DEFAULT);
+            return {
+              content: [{ type: "text", text: "Sygnatura wystepuje wielokrotnie; wybierz wlasciwe ID SAOS.\n" + formatted.text }],
+              structuredContent: { source: "saos_multiple_courts", citations: buildSearchCitations(candidates),
+                pagination: formatted.pagination, error_code: "ambiguous_signature" },
+            };
+          }
+          if (hits[0]?.id !== undefined) {
+            // A primary-source SAOS judgment takes precedence over PrawMi.
+            try {
+              const { data: doc, source } = await getJudgment(hits[0].id, "get_judgment");
+              const offset = Math.max(0, Math.floor(parseChunkArg(a.offset, 0)));
+              const limit = Math.min(JUDGMENT_CHUNK_MAX,
+                Math.max(1, Math.floor(parseChunkArg(a.limit, JUDGMENT_CHUNK_DEFAULT))));
+              const chunk = formatJudgment(doc, offset, limit);
+              const citation = buildJudgmentCitation(doc);
+              return { content: [{ type: "text", text: withSourceNote(chunk.text, source) }],
+                structuredContent: { source, citations: citation ? [citation] : [],
+                  totalLength: chunk.totalLength, returnedLength: chunk.returnedLength,
+                  offset: chunk.offset, hasMore: chunk.hasMore, nextOffset: chunk.nextOffset,
+                  truncated: chunk.truncated } };
+            } catch (err) {
+              return upstreamErrorResult(err, "Nie udalo sie pobrac tresci SAOS.");
+            }
+          }
+          if (process.env.ORZECZENIA_FALLBACK !== "1") {
+            return errorResult("Nie znaleziono sygnatury w SAOS; fallback PrawMi wylaczony.",
+              "fallback_disabled", { fault: "upstream", retryable: false });
+          }
+          try {
+            const doc = await lookupPrawMi(a.id);
+            if (!doc) {
+              return errorResult("Brak w SAOS i PrawMi; nie oznacza to braku orzeczenia.",
+                "not_found", { fault: "upstream", retryable: false });
+            }
+            return formatPrawMiDocument(
+              doc,
+              parseChunkArg(a.offset, 0),
+              parseChunkArg(a.limit, JUDGMENT_CHUNK_DEFAULT),
+            );
+          } catch (err) {
+            return errorResult(
+              "PrawMi niedostepne: " + (err instanceof CaseSignatureError ? err.code : "upstream_error"),
+              "prawmi_upstream_error", { fault: "upstream", retryable: true },
+            );
+          }
+        }
         const parsed = parseIdArg(a.id);
         if (!parsed.ok) {
           return parsed.empty
@@ -1377,24 +1538,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+
       case "search_by_case": {
         if (!a.caseNumber) {
           return errorResult("parametr 'caseNumber' jest wymagany.", "missing_arg");
+        }
+        let caseNo: string;
+        try {
+          caseNo = normalizeCaseSignature(a.caseNumber).canonical;
+        } catch (err) {
+          if (err instanceof CaseSignatureError) {
+            return errorResult(err.message, err.code, { fault: "caller", retryable: false });
+          }
+          throw err;
         }
         let raw: unknown;
         let source: Source;
         try {
           ({ data: raw, source } = await searchJudgments({
-            caseNumber: a.caseNumber as string,
+            caseNumber: caseNo,
             pageSize: PAGE_SIZE_DEFAULT,
           }, "search_by_case"));
         } catch (err) {
+          // SAOS outage is NOT a verified miss; do not fall through to PrawMi.
           return upstreamErrorResult(err, "Sprawdz polaczenie lub sprobuj ponownie.");
         }
         const { text, pagination } = formatSearchResults(raw, 0, PAGE_SIZE_DEFAULT);
+        if (pagination.totalResults === 0 && process.env.ORZECZENIA_FALLBACK === "1") {
+          try {
+            const found = await lookupPrawMi(String(a.caseNumber));
+            if (found) return formatPrawMiDocument(found);
+          } catch (err) {
+            // An unavailable third-party source does not invalidate the SAOS
+            // result and must not be called a global not_found.
+            return {
+              content: [{ type: "text", text: withSourceNote(text, source) +
+                "\nPrawMi: niedostepny/bledny fallback (" +
+                (err instanceof CaseSignatureError ? err.code : "upstream_error") + ")." }],
+              structuredContent: {
+                citations: [], source, pagination, prawmi_status: "upstream_error",
+              },
+            };
+          }
+        }
         return {
-          content: [{ type: "text", text: withSourceNote(text, source) }],
-          structuredContent: { citations: buildSearchCitations(raw), source, pagination },
+          content: [{ type: "text", text: withSourceNote(text, source) +
+            (pagination.totalResults === 0 && process.env.ORZECZENIA_FALLBACK === "1"
+              ? "\nNie znaleziono takze w PrawMi (potwierdzone HTTP 404)."
+              : "") }],
+          structuredContent: {
+            citations: buildSearchCitations(raw), source, pagination,
+            ...(pagination.totalResults === 0 ? {
+              prawmi_status: process.env.ORZECZENIA_FALLBACK === "1"
+                ? "verified_empty" : "disabled",
+            } : {}),
+          },
         };
       }
 
